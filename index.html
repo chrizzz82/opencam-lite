@@ -1,0 +1,1471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenCam Lite v0.1.0</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        :root {
+            --bg: #121212;
+            --card: #1e1e1e;
+            --accent: #00d2ff;
+            --text: #e0e0e0;
+            --donate: #ffaa00;
+            --danger: #ff4d4d;
+            --success: #00e676;
+        }
+        * { box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 20px;
+        }
+        header {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            background: var(--card);
+            padding: 14px 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            border: 1px solid #2c2c2c;
+        }
+        .brand-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.35rem;
+            font-weight: 700;
+        }
+        .version-badge {
+            background: rgba(0, 210, 255, 0.15);
+            color: var(--accent);
+            border: 1px solid var(--accent);
+            font-size: 0.78rem;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-weight: 600;
+        }
+        .header-actions {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+        }
+        .disk-badge {
+            background: #2a2a2a;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            color: #bbb;
+        }
+        button, select, input {
+            background: #2b2b2b;
+            color: var(--text);
+            border: 1px solid #3d3d3d;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+        }
+        button {
+            cursor: pointer;
+            transition: background 0.15s, transform 0.1s;
+        }
+        button:hover { background: #383838; }
+        button.primary {
+            background: var(--accent);
+            color: #000;
+            font-weight: 600;
+            border: none;
+        }
+        button.donate-btn {
+            background: var(--donate);
+            color: #000;
+            font-weight: 700;
+            border: none;
+        }
+        button.active-toggle {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+        .cam-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            align-items: flex-start;
+        }
+        .cam-card {
+            background: var(--card);
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid #2c2c2c;
+            display: flex;
+            flex-direction: column;
+            resize: both;
+            width: 520px;
+            height: 400px;
+            min-width: 350px;
+            min-height: 250px;
+        }
+        .cam-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            background: #181818;
+            border-bottom: 1px solid #2a2a2a;
+            flex-shrink: 0;
+        }
+        .cam-title { font-weight: 600; font-size: 1rem; }
+        .badge-group { display: flex; gap: 6px; align-items: center; }
+        .mode-badge {
+            font-size: 0.75rem;
+            padding: 3px 8px;
+            border-radius: 6px;
+            background: #2d2d2d;
+        }
+        .video-viewport {
+            position: relative;
+            width: 100%;
+            flex-grow: 1;
+            background: #000;
+            overflow: hidden;
+            user-select: none;
+        }
+        .zoom-stage {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            transform-origin: center center;
+            transition: transform 0.08s ease-out;
+            cursor: grab;
+        }
+        .zoom-stage:active { cursor: grabbing; }
+        .zoom-stage video {
+            width: 100%;
+            height: 100%;
+            object-fit: fill;
+            display: block;
+        }
+        .mask-overlay-layer {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            z-index: 4;
+        }
+        .mask-box {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.88);
+            border: 2px dashed rgba(0, 210, 255, 0.85);
+            box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.9);
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            padding: 3px 6px;
+            overflow: hidden;
+            pointer-events: auto;
+        }
+        .mask-box.motion-zone {
+            background: rgba(0, 230, 118, 0.25);
+            border: 2px dashed var(--success);
+        }
+        .mask-box span {
+            font-size: 0.7rem;
+            color: var(--accent);
+            background: rgba(0, 0, 0, 0.75);
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+        .mask-box.motion-zone span {
+            color: #000;
+            background: var(--success);
+        }
+        .mask-delete-btn {
+            background: rgba(255, 77, 77, 0.8);
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            font-size: 0.65rem;
+            padding: 1px 5px;
+            cursor: pointer;
+            pointer-events: auto;
+        }
+        .mask-delete-btn:hover { background: var(--danger); }
+        .zoom-indicator {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.65);
+            color: var(--accent);
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            pointer-events: none;
+            z-index: 6;
+        }
+        .zone-canvas {
+            position: absolute;
+            inset: 0;
+            z-index: 2;
+            cursor: crosshair;
+            display: none;
+        }
+        .zone-canvas.active-drawing {
+            z-index: 30;
+            display: block;
+        }
+        .cam-controls {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            background: #1b1b1b;
+            position: relative;
+            z-index: 40;
+            flex-shrink: 0;
+        }
+        .control-group {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.78);
+            z-index: 100;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .modal.active { display: flex; }
+        .modal-content {
+            background: var(--card);
+            border: 1px solid #333;
+            border-radius: 12px;
+            max-width: 1050px;
+            width: 100%;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 22px;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #333;
+            padding-bottom: 12px;
+            margin-bottom: 16px;
+        }
+        .settings-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px;
+            background: #161616;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border: 1px solid #2b2b2b;
+            align-items: center;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            background: var(--card);
+            border-radius: 12px;
+            border: 1px dashed #3a3a3a;
+        }
+        .hint-box {
+            font-size: 0.82rem;
+            color: #aaa;
+            background: #161616;
+            padding: 10px 12px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            border-left: 3px solid var(--accent);
+        }
+        .discover-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="brand-title">
+        <span>🛡️ OpenCam Lite</span>
+        <span class="version-badge" id="app-version">v0.1.0</span>
+    </div>
+    <div class="header-actions">
+        <div class="disk-badge" id="disk-info">💾 -- / -- GB</div>
+        <select id="lang-select" onchange="changeLang(this.value)">
+            <option value="en">🇬🇧 EN</option>
+            <option value="de">🇩🇪 DE</option>
+            <option value="fr">🇫🇷 FR</option>
+            <option value="es">🇪🇸 ES</option>
+        </select>
+        <button class="donate-btn" id="btn-donate" onclick="openDonate()">☕ Support</button>
+        <button id="btn-archive" onclick="openArchive()">🎬 History & Export</button>
+        <button id="btn-settings" onclick="openSettings()">⚙️ Settings</button>
+    </div>
+</header>
+
+<main id="dashboard-container"></main>
+
+<!-- Archive & Export Modal -->
+<div class="modal" id="archive-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 id="lbl-archive-title" style="margin:0;">Recordings & Time Export</h3>
+            <button onclick="closeArchive()">✖</button>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:18px;">
+            <select id="export-cam" onchange="loadArchiveList()"></select>
+            <label id="lbl-from">From:</label>
+            <input type="datetime-local" id="export-from">
+            <label id="lbl-to">To:</label>
+            <input type="datetime-local" id="export-to">
+            <button class="primary" id="btn-zip" onclick="exportTimeRange()">📥 ZIP Export</button>
+        </div>
+        <div id="events-list"></div>
+    </div>
+</div>
+
+<!-- Settings Modal -->
+<div class="modal" id="settings-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 id="lbl-settings-title" style="margin:0;">Cameras & System Settings</h3>
+            <button onclick="closeSettings()">✖</button>
+        </div>
+
+        <h4 id="lbl-sec-cams">📹 Cameras</h4>
+        <div class="hint-box" id="lbl-zone-hint">
+            <strong>Zone & Camera Setup (v0.1.0):</strong> Add cameras manually or scan your network via ONVIF. Draw zones directly in the live view.
+        </div>
+
+        <div class="discover-bar">
+            <button onclick="addCamRow()" id="btn-add-cam">+ Add Camera (Manual)</button>
+            <input type="text" id="scan-subnet" placeholder="Subnet (e.g. 192.168.178)" style="width:190px;">
+            <button onclick="scanOnvifNetwork()" id="btn-onvif-scan" style="border-color:var(--accent); color:var(--accent);">🔍 Scan ONVIF Network</button>
+            <span id="scan-status" style="font-size:0.85rem; color:#aaa;"></span>
+        </div>
+
+        <div id="cam-rows"></div>
+
+        <hr style="border-color:#333; margin:20px 0;">
+
+        <h4 id="lbl-sec-users">👥 User Management</h4>
+        <div id="user-rows"></div>
+        <button onclick="addUserRow()" id="btn-add-user">+ Add User</button>
+
+        <hr style="border-color:#333; margin:20px 0;">
+
+        <h4 id="lbl-sec-sys">⚙️ System & Push</h4>
+        <div class="settings-row">
+            <div>
+                <label id="lbl-retention">Delete recordings after (days):</label><br>
+                <input type="number" id="cfg-retention" min="1" max="365" style="width:100%;">
+            </div>
+            <div>
+                <label id="lbl-segment">Recording file length (15m steps):</label><br>
+                <select id="cfg-segment" style="width:100%;">
+                    <option value="15">15 Minutes</option>
+                    <option value="30">30 Minutes</option>
+                    <option value="45">45 Minutes</option>
+                    <option value="60">60 Minutes (1h)</option>
+                    <option value="75">75 Minutes (1h 15m)</option>
+                    <option value="90">90 Minutes (1h 30m)</option>
+                    <option value="105">105 Minutes (1h 45m)</option>
+                    <option value="120">120 Minutes (2h)</option>
+                </select>
+            </div>
+            <div>
+                <label id="lbl-ntfy">ntfy.sh Push Topic:</label><br>
+                <input type="text" id="cfg-ntfy" style="width:100%;">
+            </div>
+            <div>
+                <label id="lbl-ha">Home Assistant Webhook URL:</label><br>
+                <input type="text" id="cfg-ha" style="width:100%;">
+            </div>
+        </div>
+
+        <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:18px;">
+            <button onclick="closeSettings()" id="btn-cancel">Cancel</button>
+            <button class="primary" onclick="saveSettings()" id="btn-save">💾 Save & Apply</button>
+        </div>
+    </div>
+</div>
+
+<!-- Donate Modal -->
+<div class="modal" id="donate-modal">
+    <div class="modal-content" style="max-width:480px; text-align:center;">
+        <div class="modal-header">
+            <h3 id="lbl-donate-title" style="margin:0;">☕ Support OpenCam Lite</h3>
+            <button onclick="closeDonate()">✖</button>
+        </div>
+        <p id="lbl-donate-text" style="line-height:1.5; color:#ccc;">
+            Do you like OpenCam Lite? This project is lean, local, and ad-free. If you want to support future development, consider buying me a virtual coffee!
+        </p>
+        <div style="display:flex; flex-direction:column; gap:10px; margin:20px 0;">
+            <a id="link-paypal" href="https://paypal.me/Chrizzkai" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">
+                <button class="primary" style="width:100%;" id="lbl-paypal-btn">Donate via PayPal</button>
+            </a>
+        </div>
+        <button onclick="closeDonate()" id="btn-donate-close">Close</button>
+    </div>
+</div>
+
+<script>
+    const I18N = {
+        en: {
+            donate_btn: "☕ Support",
+            donate_title: "☕ Support OpenCam Lite",
+            donate_text: "Do you like OpenCam Lite? This project is lean, local, and ad-free. If you want to support future development, consider buying me a virtual coffee!",
+            paypal_btn: "Donate via PayPal",
+            close_btn: "Close",
+            cancel_btn: "Cancel",
+            archive_btn: "🎬 History & Export",
+            settings_btn: "⚙️ Settings",
+            welcome_title: "Welcome to OpenCam Lite!",
+            welcome_sub: "No cameras configured yet.",
+            first_cam_btn: "+ Add First Camera",
+            mode_motion: "🏃 Motion/Sound",
+            mode_always: "🔴 24/7",
+            mode_live: "👁️ Live",
+            snap_btn: "📸 Snapshot",
+            zone_btn: "⬛ + Zone",
+            mask_toggle_btn: "👁️ Zones",
+            mask_clear_btn: "🗑️",
+            zones_active: "Zones",
+            archive_title: "Recordings & Time Export",
+            from: "From:",
+            to: "To:",
+            zip_btn: "📥 ZIP Export",
+            no_events: "No recordings or events found yet.",
+            open_video: "▶️ Play / Download",
+            alert_export: "Please select camera, start time and end time!",
+            settings_title: "Cameras & System Settings",
+            sec_cams: "📹 Cameras",
+            zone_hint: "<strong>Zone & Camera Setup (v0.1.0):</strong> Add cameras manually or scan your network via ONVIF. Draw zones directly in the live view.",
+            add_cam: "+ Add Camera (Manual)",
+            onvif_scan: "🔍 Scan ONVIF Network",
+            scanning: "Scanning network for cameras...",
+            scan_done: "Scan complete: {n} camera(s) found.",
+            sec_users: "👥 User Management",
+            add_user: "+ Add User",
+            sec_sys: "⚙️ System & Push",
+            retention: "Delete recordings after (days):",
+            segment_len: "Recording file length (15m steps):",
+            ntfy: "ntfy.sh Push Topic:",
+            ha: "Home Assistant Webhook URL:",
+            save_btn: "💾 Save & Apply",
+            prompt_zone: "Select zone type for this area:\n\n1 = Privacy Zone (Blackout)\n2 = Motion Zone (Detection only)",
+            confirm_clear_zones: "Delete all zones for this camera?",
+            admin_only_zones: "Note: Only admins can save zones persistently.",
+            ph_cam_name: "Name (e.g. Entrance)",
+            ph_ip: "IP Address",
+            ph_user: "RTSP User",
+            ph_pwd: "RTSP Password",
+            ph_custom_path: "Custom Path (optional)",
+            ph_onvif_port: "ONVIF Port",
+            opt_live: "Live Only",
+            opt_motion: "Motion",
+            opt_always: "24/7 Recording",
+            ph_zones: "Zones x,y,w,h,type",
+            lbl_audio: "Audio",
+            ph_uname: "Username",
+            ph_upwd: "New Password (blank = keep)",
+            role_viewer: "Viewer (Read-Only)"
+        },
+        de: {
+            donate_btn: "☕ Unterstützen",
+            donate_title: "☕ OpenCam Lite unterstützen",
+            donate_text: "Gefällt dir OpenCam Lite? Dieses Projekt ist schlank, lokal und werbefrei. Wenn du die Weiterentwicklung unterstützen möchtest, freue ich mich über einen virtuellen Kaffee!",
+            paypal_btn: "Via PayPal spenden",
+            close_btn: "Schließen",
+            cancel_btn: "Abbrechen",
+            archive_btn: "🎬 Historie & Export",
+            settings_btn: "⚙️ Einstellungen",
+            welcome_title: "Willkommen bei OpenCam Lite!",
+            welcome_sub: "Noch keine Kameras konfiguriert.",
+            first_cam_btn: "+ Erste Kamera einrichten",
+            mode_motion: "🏃 Bewegung/Ton",
+            mode_always: "🔴 24/7",
+            mode_live: "👁️ Live",
+            snap_btn: "📸 Foto",
+            zone_btn: "⬛ + Zone",
+            mask_toggle_btn: "👁️ Zonen",
+            mask_clear_btn: "🗑️",
+            zones_active: "Zonen",
+            archive_title: "Aufnahmen & Zeit-Export",
+            from: "Von:",
+            to: "Bis:",
+            zip_btn: "📥 ZIP Export",
+            no_events: "Noch keine Aufnahmen oder Events vorhanden.",
+            open_video: "▶️ Video öffnen",
+            alert_export: "Bitte Kamera sowie Start- und Endzeitpunkt wählen!",
+            settings_title: "Kameras & System-Einstellungen",
+            sec_cams: "📹 Kameras",
+            zone_hint: "<strong>Kamera- & Zonenverwaltung (v0.1.0):</strong> Füge Kameras manuell hinzu oder nutze den ONVIF-Netzwerkscan. Zonen lassen sich direkt im Live-Bild einzeichnen.",
+            add_cam: "+ Kamera manuell hinzufügen",
+            onvif_scan: "🔍 ONVIF Netzwerk scannen",
+            scanning: "Scanne lokales Netzwerk nach Kameras...",
+            scan_done: "Scan abgeschlossen: {n} Kamera(s) gefunden.",
+            sec_users: "👥 Benutzerverwaltung",
+            add_user: "+ Benutzer hinzufügen",
+            sec_sys: "⚙️ System & Push",
+            retention: "Aufnahmen löschen nach (Tagen):",
+            segment_len: "Aufnahmelänge (15-Min-Schritte):",
+            ntfy: "ntfy.sh Push Topic:",
+            ha: "Home Assistant Webhook URL:",
+            save_btn: "💾 Speichern & Übernehmen",
+            prompt_zone: "Wähle den Zonentyp für diesen Bereich:\n\n1 = Privatzone (Bereich dauerhaft schwärzen)\n2 = Bewegungszone (Nur für Motion/Erkennung)",
+            confirm_clear_zones: "Alle Zonen für diese Kamera wirklich löschen?",
+            admin_only_zones: "Hinweis: Nur Administratoren können Zonen dauerhaft speichern.",
+            ph_cam_name: "Name (z.B. Einfahrt)",
+            ph_ip: "IP-Adresse",
+            ph_user: "RTSP Benutzer",
+            ph_pwd: "RTSP Passwort",
+            ph_custom_path: "Eigener Pfad (optional)",
+            ph_onvif_port: "ONVIF Port",
+            opt_live: "Nur Live",
+            opt_motion: "Bewegung",
+            opt_always: "24/7 Aufnahme",
+            ph_zones: "Zonen x,y,b,h,typ",
+            lbl_audio: "Ton",
+            ph_uname: "Benutzername",
+            ph_upwd: "Neues Passwort (leer = behalten)",
+            role_viewer: "Viewer (Nur Lesen)"
+        },
+        fr: {
+            donate_btn: "☕ Soutenir",
+            donate_title: "☕ Soutenir OpenCam Lite",
+            donate_text: "Vous aimez OpenCam Lite ? Ce projet est léger, local et sans publicité. Si vous souhaitez soutenir le développement, un café virtuel me ferait plaisir !",
+            paypal_btn: "Faire un don via PayPal",
+            close_btn: "Fermer",
+            cancel_btn: "Annuler",
+            archive_btn: "🎬 Historique & Export",
+            settings_btn: "⚙️ Paramètres",
+            welcome_title: "Bienvenue sur OpenCam Lite !",
+            welcome_sub: "Aucune caméra configurée.",
+            first_cam_btn: "+ Ajouter une caméra",
+            mode_motion: "🏃 Mouvement/Son",
+            mode_always: "🔴 24/7",
+            mode_live: "👁️ Direct",
+            snap_btn: "📸 Capture",
+            zone_btn: "⬛ + Zone",
+            mask_toggle_btn: "👁️ Zones",
+            mask_clear_btn: "🗑️",
+            zones_active: "Zones",
+            archive_title: "Enregistrements & Export",
+            from: "De :",
+            to: "À :",
+            zip_btn: "📥 Exporter ZIP",
+            no_events: "Aucun enregistrement trouvé.",
+            open_video: "▶️ Ouvrir la vidéo",
+            alert_export: "Veuillez sélectionner une caméra ainsi qu'une date de début et de fin !",
+            settings_title: "Caméras & Paramètres système",
+            sec_cams: "📹 Caméras",
+            zone_hint: "<strong>Configuration (v0.1.0) :</strong> Ajoutez des caméras manuellement ou scannez le réseau via ONVIF.",
+            add_cam: "+ Ajouter manuellement",
+            onvif_scan: "🔍 Scanner le réseau ONVIF",
+            scanning: "Scan du réseau en cours...",
+            scan_done: "Scan terminé : {n} caméra(s) trouvée(s).",
+            sec_users: "👥 Gestion des utilisateurs",
+            add_user: "+ Ajouter un utilisateur",
+            sec_sys: "⚙️ Système & Push",
+            retention: "Supprimer les enregistrements après (jours) :",
+            segment_len: "Longueur des fichiers (pas de 15m) :",
+            ntfy: "Sujet Push ntfy.sh :",
+            ha: "URL Webhook Home Assistant :",
+            save_btn: "💾 Enregistrer & Appliquer",
+            prompt_zone: "Sélectionnez le type de zone :\n\n1 = Zone de confidentialité (masquer)\n2 = Zone de mouvement (détection)",
+            confirm_clear_zones: "Supprimer toutes les zones de cette caméra ?",
+            admin_only_zones: "Note : Seuls les administrateurs peuvent enregistrer des zones.",
+            ph_cam_name: "Nom (ex. Entrée)",
+            ph_ip: "Adresse IP",
+            ph_user: "Utilisateur RTSP",
+            ph_pwd: "Mot de passe RTSP",
+            ph_custom_path: "Chemin personnalisé (opt.)",
+            ph_onvif_port: "Port ONVIF",
+            opt_live: "Direct uniquement",
+            opt_motion: "Mouvement",
+            opt_always: "Enregistrement 24/7",
+            ph_zones: "Zones x,y,l,h,type",
+            lbl_audio: "Audio",
+            ph_uname: "Nom d'utilisateur",
+            ph_upwd: "Nouveau mot de passe (vide = garder)",
+            role_viewer: "Lecteur (Lecture seule)"
+        },
+        es: {
+            donate_btn: "☕ Apoyar",
+            donate_title: "☕ Apoyar OpenCam Lite",
+            donate_text: "¿Te gusta OpenCam Lite? Este proyecto es ligero, local y sin publicidad. Si deseas apoyar el desarrollo futuro, ¡invítame a un café virtual!",
+            paypal_btn: "Donar vía PayPal",
+            close_btn: "Cerrar",
+            cancel_btn: "Cancelar",
+            archive_btn: "🎬 Historial y Exportar",
+            settings_btn: "⚙️ Ajustes",
+            welcome_title: "¡Bienvenido a OpenCam Lite!",
+            welcome_sub: "Aún no hay cámaras configuradas.",
+            first_cam_btn: "+ Añadir primera cámara",
+            mode_motion: "🏃 Movimiento/Sonido",
+            mode_always: "🔴 24/7",
+            mode_live: "👁️ En vivo",
+            snap_btn: "📸 Foto",
+            zone_btn: "⬛ + Zona",
+            mask_toggle_btn: "👁️ Zonas",
+            mask_clear_btn: "🗑️",
+            zones_active: "Zonas",
+            archive_title: "Grabaciones y Exportación",
+            from: "Desde:",
+            to: "Hasta:",
+            zip_btn: "📥 Exportar ZIP",
+            no_events: "Aún no hay grabaciones registradas.",
+            open_video: "▶️ Abrir vídeo",
+            alert_export: "¡Selecciona una cámara, fecha de inicio y de fin!",
+            settings_title: "Cámaras y Ajustes del Sistema",
+            sec_cams: "📹 Cámaras",
+            zone_hint: "<strong>Configuración (v0.1.0):</strong> Añade cámaras manualmente o escanea la red mediante ONVIF.",
+            add_cam: "+ Añadir manualmente",
+            onvif_scan: "🔍 Escanear red ONVIF",
+            scanning: "Escaneando red local...",
+            scan_done: "Escaneo completo: {n} cámara(s) encontrada(s).",
+            sec_users: "👥 Gestión de Usuarios",
+            add_user: "+ Añadir usuario",
+            sec_sys: "⚙️ Sistema y Push",
+            retention: "Eliminar grabaciones después de (días):",
+            segment_len: "Duración de archivo (pasos de 15m):",
+            ntfy: "Tema Push ntfy.sh:",
+            ha: "URL de Webhook de Home Assistant:",
+            save_btn: "💾 Guardar y Aplicar",
+            prompt_zone: "Selecciona el tipo de zona:\n\n1 = Zona de privacidad (Oscurecer)\n2 = Zona de movimiento (Detección)",
+            confirm_clear_zones: "¿Eliminar todas las zonas de esta cámara?",
+            admin_only_zones: "Nota: Solo los administradores pueden guardar zonas permanentemente.",
+            ph_cam_name: "Nombre (ej. Entrada)",
+            ph_ip: "Dirección IP",
+            ph_user: "Usuario RTSP",
+            ph_pwd: "Contraseña RTSP",
+            ph_custom_path: "Ruta personalizada (opc.)",
+            ph_onvif_port: "Puerto ONVIF",
+            opt_live: "Solo en vivo",
+            opt_motion: "Movimiento",
+            opt_always: "Grabación 24/7",
+            ph_zones: "Zonas x,y,a,h,tipo",
+            lbl_audio: "Audio",
+            ph_uname: "Nombre de usuario",
+            ph_upwd: "Nueva contraseña (vacío = mantener)",
+            role_viewer: "Visor (Solo lectura)"
+        }
+    };
+
+    let currentLang = localStorage.getItem("opencam_lang") || "en";
+    let currentSettings = {
+        version: "0.1.0",
+        retention_days: 7,
+        segment_minutes: 60,
+        ntfy_topic: "",
+        ha_webhook: "",
+        paypal_url: "https://paypal.me/Chrizzkai",
+        language: currentLang,
+        users: [],
+        cameras: []
+    };
+
+    const zoomState = {};
+    const showMaskOverlay = {};
+    const activeHlsInstances = {};
+    let renderedStreamSignature = "";
+
+    function t(key) {
+        return (I18N[currentLang] && I18N[currentLang][key]) || I18N["en"][key] || key;
+    }
+
+    function computeFrontendStreamSig(cams) {
+        return JSON.stringify((cams || []).map(c => ({
+            id: c.cam_id,
+            ip: c.ip,
+            brand: c.brand,
+            res: c.res,
+            custom_path: c.custom_path,
+            ptz: c.ptz
+        })));
+    }
+
+    function applyTranslations() {
+        document.documentElement.lang = currentLang;
+        document.getElementById("lang-select").value = currentLang;
+        document.getElementById("btn-donate").innerText = t("donate_btn");
+        document.getElementById("lbl-donate-title").innerText = t("donate_title");
+        document.getElementById("lbl-donate-text").innerText = t("donate_text");
+        document.getElementById("lbl-paypal-btn").innerText = t("paypal_btn");
+        document.getElementById("btn-donate-close").innerText = t("close_btn");
+        document.getElementById("btn-archive").innerText = t("archive_btn");
+        document.getElementById("btn-settings").innerText = t("settings_btn");
+        document.getElementById("lbl-archive-title").innerText = t("archive_title");
+        document.getElementById("lbl-from").innerText = t("from");
+        document.getElementById("lbl-to").innerText = t("to");
+        document.getElementById("btn-zip").innerText = t("zip_btn");
+        document.getElementById("lbl-settings-title").innerText = t("settings_title");
+        document.getElementById("lbl-sec-cams").innerText = t("sec_cams");
+        document.getElementById("lbl-zone-hint").innerHTML = t("zone_hint");
+        document.getElementById("btn-add-cam").innerText = t("add_cam");
+        document.getElementById("btn-onvif-scan").innerText = t("onvif_scan");
+        document.getElementById("lbl-sec-users").innerText = t("sec_users");
+        document.getElementById("btn-add-user").innerText = t("add_user");
+        document.getElementById("lbl-sec-sys").innerText = t("sec_sys");
+        document.getElementById("lbl-retention").innerText = t("retention");
+        document.getElementById("lbl-segment").innerText = t("segment_len");
+        document.getElementById("lbl-ntfy").innerText = t("ntfy");
+        document.getElementById("lbl-ha").innerText = t("ha");
+        document.getElementById("btn-cancel").innerText = t("cancel_btn");
+        document.getElementById("btn-save").innerText = t("save_btn");
+        updateCardLabelsInPlace();
+    }
+
+    function updateCardLabelsInPlace() {
+        const cams = currentSettings.cameras || [];
+        cams.forEach((cam, idx) => {
+            const snapBtn = document.getElementById(`btn-snap-${idx}`);
+            const zoneBtn = document.getElementById(`btn-zone-${idx}`);
+            const maskVisBtn = document.getElementById(`btn-mask-vis-${idx}`);
+            const modeBadge = document.getElementById(`mode-badge-${idx}`);
+            const zoneBadge = document.getElementById(`zone-badge-${idx}`);
+
+            if (snapBtn) snapBtn.innerText = t("snap_btn");
+            if (zoneBtn) zoneBtn.innerText = t("zone_btn");
+            if (maskVisBtn) maskVisBtn.innerText = t("mask_toggle_btn");
+            if (modeBadge) {
+                modeBadge.innerText = cam.mode === "always" ? t("mode_always") : (cam.mode === "motion" ? t("mode_motion") : t("mode_live"));
+            }
+            if (zoneBadge) {
+                const zCount = parseMaskZones(cam.mask_zones).length;
+                if (zCount > 0) {
+                    zoneBadge.style.display = "inline-block";
+                    zoneBadge.innerText = `⬛ ${zCount} ${t("zones_active")}`;
+                } else {
+                    zoneBadge.style.display = "none";
+                }
+            }
+        });
+    }
+
+    async function changeLang(lang) {
+        currentLang = lang;
+        currentSettings.language = lang;
+        localStorage.setItem("opencam_lang", lang);
+        applyTranslations();
+
+        if ((currentSettings.cameras || []).length === 0) {
+            renderDashboard();
+        }
+
+        try {
+            await fetch("/api/language", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ language: currentLang })
+            });
+        } catch (e) {
+            console.error("Failed to save language:", e);
+        }
+    }
+
+    async function loadDashboard() {
+        try {
+            const res = await fetch("/api/settings");
+            const newSettings = await res.json();
+            currentSettings = newSettings;
+
+            currentLang = currentSettings.language || localStorage.getItem("opencam_lang") || "en";
+            localStorage.setItem("opencam_lang", currentLang);
+
+            if (currentSettings.version) {
+                document.getElementById("app-version").innerText = "v" + currentSettings.version;
+                document.title = "OpenCam Lite v" + currentSettings.version;
+            }
+            if (currentSettings.current_user && currentSettings.current_user.role !== "admin") {
+                document.getElementById("btn-settings").style.display = "none";
+            } else {
+                document.getElementById("btn-settings").style.display = "inline-block";
+            }
+
+            const newSig = computeFrontendStreamSig(currentSettings.cameras);
+            if (newSig !== renderedStreamSignature || document.getElementById("dashboard-container").innerHTML.trim() === "") {
+                renderedStreamSignature = newSig;
+                renderDashboard();
+            } else {
+                (currentSettings.cameras || []).forEach((_, idx) => renderMaskOverlays(idx));
+            }
+
+            applyTranslations();
+            updateDiskUsage();
+        } catch (e) {
+            console.error("Dashboard could not be loaded:", e);
+        }
+    }
+
+    async function updateDiskUsage() {
+        try {
+            const res = await fetch("/api/disk");
+            const d = await res.json();
+            document.getElementById("disk-info").innerText = `💾 ${d.used} / ${d.total} GB (${d.percent}%)`;
+        } catch (e) {}
+    }
+
+    function parseMaskZones(maskStr) {
+        if (!maskStr || !String(maskStr).trim()) return [];
+        return String(maskStr).split(";").map(p => p.trim()).filter(Boolean).map(part => {
+            const coords = part.split(",");
+            if (coords.length < 4) return null;
+            const nums = coords.slice(0, 4).map(Number);
+            if (nums.some(isNaN)) return null;
+            const zType = (coords[4] || "privacy").trim().toLowerCase();
+            return {
+                raw: part,
+                type: zType,
+                x: Math.max(0, Math.min(100, nums[0])),
+                y: Math.max(0, Math.min(100, nums[1])),
+                w: Math.max(1, Math.min(100, nums[2])),
+                h: Math.max(1, Math.min(100, nums[3]))
+            };
+        }).filter(Boolean);
+    }
+
+    function renderMaskOverlays(idx) {
+        const layer = document.getElementById(`mask-layer-${idx}`);
+        if (!layer) return;
+        const cam = (currentSettings.cameras || [])[idx];
+        if (!cam || !showMaskOverlay[idx]) {
+            layer.innerHTML = "";
+            return;
+        }
+        const zones = parseMaskZones(cam.mask_zones);
+        layer.innerHTML = zones.map((z, i) => {
+            const isMotion = z.type === "motion";
+            const boxClass = isMotion ? "mask-box motion-zone" : "mask-box";
+            const label = isMotion ? `M${i + 1}` : `Z${i + 1}`;
+            return `
+                <div class="${boxClass}" style="left:${z.x}%; top:${z.y}%; width:${z.w}%; height:${z.h}%;">
+                    <span>${label}</span>
+                    <button class="mask-delete-btn" onclick="removeSingleMask(${idx}, '${z.raw}')" title="Delete">✕</button>
+                </div>
+            `;
+        }).join("");
+        updateCardLabelsInPlace();
+    }
+
+    function toggleMaskVisibility(idx) {
+        showMaskOverlay[idx] = !showMaskOverlay[idx];
+        const btn = document.getElementById(`btn-mask-vis-${idx}`);
+        if (btn) {
+            btn.classList.toggle("active-toggle", showMaskOverlay[idx]);
+        }
+        renderMaskOverlays(idx);
+    }
+
+    async function removeSingleMask(idx, targetRaw) {
+        const cam = (currentSettings.cameras || [])[idx];
+        if (!cam) return;
+        const zones = parseMaskZones(cam.mask_zones);
+        const filtered = zones.filter(z => z.raw !== targetRaw).map(z => z.raw);
+        const newMaskStr = filtered.join("; ");
+        await quickSaveCameraMask(idx, newMaskStr);
+    }
+
+    async function quickSaveCameraMask(idx, newMaskStr) {
+        if (!currentSettings.cameras || !currentSettings.cameras[idx]) return;
+        currentSettings.cameras[idx].mask_zones = newMaskStr;
+        renderMaskOverlays(idx);
+
+        if (currentSettings.current_user && currentSettings.current_user.role !== "admin") {
+            alert(t("admin_only_zones"));
+            return;
+        }
+
+        const payload = {
+            version: "0.1.0",
+            language: currentLang,
+            retention_days: currentSettings.retention_days || 7,
+            segment_minutes: currentSettings.segment_minutes || 60,
+            ntfy_topic: currentSettings.ntfy_topic || "",
+            ha_webhook: currentSettings.ha_webhook || "",
+            cameras: currentSettings.cameras,
+            users: currentSettings.users || []
+        };
+
+        await fetch("/api/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+    }
+
+    async function clearCameraMasks(idx) {
+        if (!confirm(t("confirm_clear_zones"))) return;
+        await quickSaveCameraMask(idx, "");
+    }
+
+    function renderDashboard() {
+        const container = document.getElementById("dashboard-container");
+        const cams = currentSettings.cameras || [];
+        if (cams.length === 0) {
+            container.innerHTML = `
+                <div class="empty-state">
+                    <h2>${t("welcome_title")}</h2>
+                    <p>${t("welcome_sub")}</p>
+                    <button class="primary" onclick="openSettings()">${t("first_cam_btn")}</button>
+                </div>
+            `;
+            return;
+        }
+
+        container.innerHTML = `<div class="cam-grid" id="cam-grid"></div>`;
+        const grid = document.getElementById("cam-grid");
+
+        cams.forEach((cam, idx) => {
+            zoomState[idx] = { scale: 1, x: 0, y: 0, dragging: false, startX: 0, startY: 0 };
+            if (showMaskOverlay[idx] === undefined) showMaskOverlay[idx] = true;
+
+            const modeLabel = cam.mode === "always" ? t("mode_always") : (cam.mode === "motion" ? t("mode_motion") : t("mode_live"));
+            const zones = parseMaskZones(cam.mask_zones);
+            const hasMask = zones.length > 0;
+
+            const savedSize = localStorage.getItem(`cam_size_${cam.cam_id}`);
+
+            const card = document.createElement("div");
+            card.className = "cam-card";
+            if (savedSize) {
+                try {
+                    const sz = JSON.parse(savedSize);
+                    card.style.width = sz.w + "px";
+                    card.style.height = sz.h + "px";
+                } catch (e) {}
+            }
+
+            const resizeObs = new ResizeObserver(entries => {
+                for (let entry of entries) {
+                    const w = Math.round(entry.contentRect.width);
+                    const h = Math.round(entry.contentRect.height);
+                    if (w >= 300 && h >= 200) {
+                        localStorage.setItem(`cam_size_${cam.cam_id}`, JSON.stringify({ w, h }));
+                    }
+                }
+            });
+            resizeObs.observe(card);
+
+            card.innerHTML = `
+                <div class="cam-header">
+                    <span class="cam-title">${cam.name || "Camera " + (idx + 1)} <small style="color:#888;">(${cam.brand || "tapo"})</small></span>
+                    <div class="badge-group">
+                        <span class="mode-badge" id="zone-badge-${idx}" style="color:var(--accent); border:1px solid var(--accent); display:${hasMask ? 'inline-block' : 'none'};">⬛ ${zones.length} ${t("zones_active")}</span>
+                        <span class="mode-badge" id="mode-badge-${idx}">${modeLabel}</span>
+                    </div>
+                </div>
+                <div class="video-viewport" id="viewport-${idx}">
+                    <span class="zoom-indicator" id="zoom-ind-${idx}">1.0x</span>
+                    <div class="zoom-stage" id="stage-${idx}">
+                        <video id="video-${idx}" autoplay muted playsinline controls></video>
+                        <div class="mask-overlay-layer" id="mask-layer-${idx}"></div>
+                    </div>
+                    <canvas class="zone-canvas" id="zone-canvas-${idx}"></canvas>
+                </div>
+                <div class="cam-controls">
+                    <div class="control-group">
+                        <button onclick="adjustZoom(${idx}, 0.5)" title="Zoom in">🔍+</button>
+                        <button onclick="adjustZoom(${idx}, -0.5)" title="Zoom out">🔍-</button>
+                        <button onclick="resetZoom(${idx})" title="Reset zoom">1:1</button>
+                        <button onclick="takeSnapshot(${idx})" id="btn-snap-${idx}">${t("snap_btn")}</button>
+                        <button onclick="toggleZoneMeasure(${idx})" id="btn-zone-${idx}">${t("zone_btn")}</button>
+                        <button onclick="toggleMaskVisibility(${idx})" id="btn-mask-vis-${idx}" class="${showMaskOverlay[idx] ? "active-toggle" : ""}">${t("mask_toggle_btn")}</button>
+                        <button onclick="clearCameraMasks(${idx})" style="color:var(--danger);">${t("mask_clear_btn")}</button>
+                    </div>
+                    ${cam.ptz ? `
+                    <div class="control-group">
+                        <button onmousedown="ptz(${idx}, 'left')" onmouseup="ptz(${idx}, 'stop')">⬅️</button>
+                        <button onmousedown="ptz(${idx}, 'up')" onmouseup="ptz(${idx}, 'stop')">⬆️</button>
+                        <button onmousedown="ptz(${idx}, 'down')" onmouseup="ptz(${idx}, 'stop')">⬇️</button>
+                        <button onmousedown="ptz(${idx}, 'right')" onmouseup="ptz(${idx}, 'stop')">➡️</button>
+                    </div>` : ""}
+                </div>
+            `;
+            grid.appendChild(card);
+
+            initStream(idx, cam.cam_id);
+            initZoomAndPan(idx);
+            initZoneCanvas(idx);
+            renderMaskOverlays(idx);
+        });
+    }
+
+    function initStream(idx, camId) {
+        const video = document.getElementById(`video-${idx}`);
+        const url = `/stream/${camId}/index.m3u8`;
+
+        if (activeHlsInstances[idx]) {
+            activeHlsInstances[idx].destroy();
+        }
+
+        if (Hls.isSupported()) {
+            const hls = new Hls({
+                liveSyncDurationCount: 2,
+                maxBufferLength: 6,
+                manifestLoadingTimeOut: 10000,
+                manifestLoadingMaxRetry: Infinity,
+                manifestLoadingRetryDelay: 1500,
+                levelLoadingMaxRetry: Infinity,
+                fragLoadingMaxRetry: Infinity
+            });
+            hls.loadSource(url);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                video.play().catch(() => {});
+            });
+            hls.on(Hls.Events.ERROR, (event, data) => {
+                if (data.fatal) {
+                    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                        setTimeout(() => hls.startLoad(), 1500);
+                    } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                        hls.recoverMediaError();
+                    } else {
+                        setTimeout(() => initStream(idx, camId), 2000);
+                    }
+                }
+            });
+            activeHlsInstances[idx] = hls;
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            video.src = url;
+        }
+    }
+
+    // --- ZOOM & PAN ---
+    function applyZoomTransform(idx) {
+        const st = zoomState[idx];
+        const stage = document.getElementById(`stage-${idx}`);
+        const ind = document.getElementById(`zoom-ind-${idx}`);
+        if (!stage || !st) return;
+        if (st.scale <= 1) {
+            st.scale = 1;
+            st.x = 0;
+            st.y = 0;
+        }
+        stage.style.transform = `translate(${st.x}px, ${st.y}px) scale(${st.scale})`;
+        ind.innerText = `${st.scale.toFixed(1)}x`;
+    }
+
+    function adjustZoom(idx, delta) {
+        const st = zoomState[idx];
+        if (!st) return;
+        st.scale = Math.min(5.0, Math.max(1.0, st.scale + delta));
+        applyZoomTransform(idx);
+    }
+
+    function resetZoom(idx) {
+        const st = zoomState[idx];
+        if (!st) return;
+        st.scale = 1.0;
+        st.x = 0;
+        st.y = 0;
+        applyZoomTransform(idx);
+    }
+
+    function initZoomAndPan(idx) {
+        const viewport = document.getElementById(`viewport-${idx}`);
+        const stage = document.getElementById(`stage-${idx}`);
+        const st = zoomState[idx];
+
+        viewport.addEventListener("wheel", (e) => {
+            e.preventDefault();
+            const delta = e.deltaY < 0 ? 0.25 : -0.25;
+            adjustZoom(idx, delta);
+        }, { passive: false });
+
+        stage.addEventListener("mousedown", (e) => {
+            if (st.scale <= 1) return;
+            st.dragging = true;
+            st.startX = e.clientX - st.x;
+            st.startY = e.clientY - st.y;
+        });
+
+        window.addEventListener("mousemove", (e) => {
+            if (!st.dragging) return;
+            st.x = e.clientX - st.startX;
+            st.y = e.clientY - st.startY;
+            applyZoomTransform(idx);
+        });
+
+        window.addEventListener("mouseup", () => {
+            st.dragging = false;
+        });
+    }
+
+    // --- ZONE DRAWER ---
+    function toggleZoneMeasure(idx) {
+        const canvas = document.getElementById(`zone-canvas-${idx}`);
+        const btn = document.getElementById(`btn-zone-${idx}`);
+        const isDrawing = canvas.classList.toggle("active-drawing");
+        if (isDrawing) {
+            resetZoom(idx);
+            canvas.width = canvas.parentElement.clientWidth;
+            canvas.height = canvas.parentElement.clientHeight;
+            btn.classList.add("active-toggle");
+        } else {
+            btn.classList.remove("active-toggle");
+        }
+    }
+
+    function initZoneCanvas(idx) {
+        const canvas = document.getElementById(`zone-canvas-${idx}`);
+        const ctx = canvas.getContext("2d");
+        let drawing = false;
+        let sx = 0, sy = 0;
+
+        canvas.addEventListener("mousedown", (e) => {
+            const rect = canvas.getBoundingClientRect();
+            sx = e.clientX - rect.left;
+            sy = e.clientY - rect.top;
+            drawing = true;
+        });
+
+        canvas.addEventListener("mousemove", (e) => {
+            if (!drawing) return;
+            const rect = canvas.getBoundingClientRect();
+            const cx = e.clientX - rect.left;
+            const cy = e.clientY - rect.top;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = "rgba(0, 0, 0, 0.82)";
+            ctx.strokeStyle = "#00d2ff";
+            ctx.lineWidth = 2;
+            ctx.fillRect(sx, sy, cx - sx, cy - sy);
+            ctx.strokeRect(sx, sy, cx - sx, cy - sy);
+        });
+
+        canvas.addEventListener("mouseup", async (e) => {
+            if (!drawing) return;
+            drawing = false;
+            const rect = canvas.getBoundingClientRect();
+            const ex = e.clientX - rect.left;
+            const ey = e.clientY - rect.top;
+
+            const xPct = Math.round((Math.min(sx, ex) / canvas.width) * 100);
+            const yPct = Math.round((Math.min(sy, ey) / canvas.height) * 100);
+            const wPct = Math.round((Math.abs(ex - sx) / canvas.width) * 100);
+            const hPct = Math.round((Math.abs(ey - sy) / canvas.height) * 100);
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            toggleZoneMeasure(idx);
+
+            if (wPct > 1 && hPct > 1) {
+                const zoneTypeChoice = prompt(t("prompt_zone"), "1");
+                if (zoneTypeChoice === null) return;
+                const zType = zoneTypeChoice.trim() === "2" ? "motion" : "privacy";
+
+                const coordStr = `${xPct},${yPct},${wPct},${hPct},${zType}`;
+                const cam = currentSettings.cameras[idx];
+                const existing = (cam.mask_zones || "").trim();
+                const combined = existing ? `${existing}; ${coordStr}` : coordStr;
+
+                await quickSaveCameraMask(idx, combined);
+            }
+        });
+    }
+
+    async function ptz(idx, dir) {
+        await fetch("/api/ptz", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ idx, dir })
+        });
+    }
+
+    function takeSnapshot(idx) {
+        const video = document.getElementById(`video-${idx}`);
+        if (video && video.readyState >= 2 && video.videoWidth > 0) {
+            try {
+                const c = document.createElement("canvas");
+                c.width = video.videoWidth;
+                c.height = video.videoHeight;
+                const ctx = c.getContext("2d");
+                ctx.drawImage(video, 0, 0, c.width, c.height);
+                c.toBlob((blob) => {
+                    if (!blob) {
+                        window.open(`/api/snapshot?idx=${idx}&t=${Date.now()}`, "_blank");
+                        return;
+                    }
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `snapshot_cam_${idx + 1}_${Date.now()}.jpg`;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                }, "image/jpeg", 0.95);
+                return;
+            } catch (e) {}
+        }
+        window.open(`/api/snapshot?idx=${idx}&t=${Date.now()}`, "_blank");
+    }
+
+    // --- ARCHIVE & EXPORT ---
+    async function openArchive() {
+        document.getElementById("archive-modal").classList.add("active");
+        const sel = document.getElementById("export-cam");
+        sel.innerHTML = "";
+        (currentSettings.cameras || []).forEach((c) => {
+            const opt = document.createElement("option");
+            opt.value = c.cam_id;
+            opt.innerText = c.name;
+            sel.appendChild(opt);
+        });
+        await loadArchiveList();
+    }
+
+    async function loadArchiveList() {
+        const sel = document.getElementById("export-cam");
+        const camId = sel ? sel.value : "";
+        const list = document.getElementById("events-list");
+
+        const [evRes, recRes] = await Promise.all([
+            fetch("/api/events"),
+            fetch(`/api/recordings?cam_id=${encodeURIComponent(camId)}`)
+        ]);
+        const events = await evRes.json();
+        const recordings = await recRes.json();
+
+        const items = [];
+        recordings.forEach(r => {
+            items.push({
+                label: `<strong>${r.camera}</strong> – ${r.timestamp} <small style="color:#888;">(24/7 Segment, ${r.size_mb} MB)</small>`,
+                filepath: r.filepath
+            });
+        });
+        events.forEach(ev => {
+            items.push({
+                label: `<strong>${ev.camera}</strong> – ${ev.timestamp} (${ev.type})`,
+                filepath: ev.filepath
+            });
+        });
+
+        if (!items.length) {
+            list.innerHTML = `<p style="color:#888;">${t("no_events")}</p>`;
+            return;
+        }
+        list.innerHTML = items.map(it => `
+            <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-bottom:1px solid #2b2b2b;">
+                <span>${it.label}</span>
+                <a href="${it.filepath}" target="_blank" style="color:var(--accent); text-decoration:none; font-weight:600;">${t("open_video")}</a>
+            </div>
+        `).join("");
+    }
+
+    function closeArchive() {
+        document.getElementById("archive-modal").classList.remove("active");
+    }
+
+    function exportTimeRange() {
+        const camId = document.getElementById("export-cam").value;
+        const from = document.getElementById("export-from").value;
+        const to = document.getElementById("export-to").value;
+        if (!camId || !from || !to) {
+            alert(t("alert_export"));
+            return;
+        }
+        window.open(`/api/export?cam_id=${encodeURIComponent(camId)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, "_blank");
+    }
+
+    // --- SETTINGS & ONVIF DISCOVERY ---
+    function openSettings() {
+        document.getElementById("settings-modal").classList.add("active");
+        document.getElementById("scan-status").innerText = "";
+        const camContainer = document.getElementById("cam-rows");
+        camContainer.innerHTML = "";
+        (currentSettings.cameras || []).forEach(c => addCamRow(c));
+
+        // Subnetz-Vorschlag aus vorhandener Kamera oder Browser-URL ableiten
+        const subnetInput = document.getElementById("scan-subnet");
+        if (!subnetInput.value) {
+            const firstIp = ((currentSettings.cameras || [])[0] || {}).ip || window.location.hostname;
+            if (firstIp && firstIp.split(".").length === 4) {
+                subnetInput.value = firstIp.split(".").slice(0, 3).join(".");
+            }
+        }
+
+        const userContainer = document.getElementById("user-rows");
+        userContainer.innerHTML = "";
+        (currentSettings.users || []).forEach(u => addUserRow(u));
+
+        document.getElementById("cfg-retention").value = currentSettings.retention_days || 7;
+        document.getElementById("cfg-segment").value = currentSettings.segment_minutes || 60;
+        document.getElementById("cfg-ntfy").value = currentSettings.ntfy_topic || "";
+        document.getElementById("cfg-ha").value = currentSettings.ha_webhook || "";
+    }
+
+    function closeSettings() {
+        document.getElementById("settings-modal").classList.remove("active");
+    }
+
+    async function scanOnvifNetwork() {
+        const statusEl = document.getElementById("scan-status");
+        const subnet = document.getElementById("scan-subnet").value.trim();
+        statusEl.innerText = t("scanning");
+        try {
+            const res = await fetch(`/api/onvif_scan?subnet=${encodeURIComponent(subnet)}`);
+            const data = await res.json();
+            const devices = data.devices || [];
+            const existingIps = new Set(
+                Array.from(document.querySelectorAll(".c-ip")).map(el => el.value.trim())
+            );
+            let added = 0;
+            devices.forEach(dev => {
+                if (!existingIps.has(dev.ip)) {
+                    addCamRow({
+                        name: dev.name,
+                        brand: dev.brand,
+                        ip: dev.ip,
+                        onvif_port: dev.onvif_port,
+                        res: "hd",
+                        mode: "always",
+                        ptz: true,
+                        audio: true
+                    });
+                    existingIps.add(dev.ip);
+                    added++;
+                }
+            });
+            statusEl.innerText = t("scan_done").replace("{n}", devices.length);
+        } catch (e) {
+            statusEl.innerText = "Scan error.";
+        }
+    }
+
+    function addCamRow(cam = {}) {
+        const row = document.createElement("div");
+        row.className = "settings-row cam-row-item";
+        row.innerHTML = `
+            <input type="text" placeholder="${t("ph_cam_name")}" class="c-name" value="${cam.name || ""}">
+            <select class="c-brand">
+                <option value="tapo" ${cam.brand === "tapo" ? "selected" : ""}>TP-Link Tapo</option>
+                <option value="reolink" ${cam.brand === "reolink" ? "selected" : ""}>Reolink</option>
+                <option value="hikvision" ${cam.brand === "hikvision" ? "selected" : ""}>Hikvision</option>
+                <option value="dahua" ${cam.brand === "dahua" ? "selected" : ""}>Dahua</option>
+                <option value="amcrest" ${cam.brand === "amcrest" ? "selected" : ""}>Amcrest</option>
+                <option value="foscam" ${cam.brand === "foscam" ? "selected" : ""}>Foscam</option>
+                <option value="uniview" ${cam.brand === "uniview" ? "selected" : ""}>Uniview (UNV)</option>
+                <option value="axis" ${cam.brand === "axis" ? "selected" : ""}>Axis</option>
+                <option value="generic" ${cam.brand === "generic" ? "selected" : ""}>Generic ONVIF</option>
+            </select>
+            <input type="text" placeholder="${t("ph_ip")}" class="c-ip" value="${cam.ip || ""}">
+            <input type="text" placeholder="${t("ph_user")}" class="c-user" value="${cam.user || ""}">
+            <input type="password" placeholder="${t("ph_pwd")}" class="c-pwd" value="${cam.password || ""}">
+            <select class="c-res">
+                <option value="hd" ${cam.res === "hd" ? "selected" : ""}>HD (Main)</option>
+                <option value="sd" ${cam.res === "sd" ? "selected" : ""}>SD (Sub)</option>
+            </select>
+            <select class="c-mode">
+                <option value="live" ${cam.mode === "live" ? "selected" : ""}>${t("opt_live")}</option>
+                <option value="motion" ${cam.mode === "motion" ? "selected" : ""}>${t("opt_motion")}</option>
+                <option value="always" ${cam.mode === "always" ? "selected" : ""}>${t("opt_always")}</option>
+            </select>
+            <input type="text" placeholder="${t("ph_custom_path")}" class="c-path" value="${cam.custom_path || ""}">
+            <input type="number" placeholder="${t("ph_onvif_port")}" class="c-onvif" value="${cam.onvif_port || ""}">
+            <input type="text" placeholder="${t("ph_zones")}" class="c-mask" value="${cam.mask_zones || ""}">
+            <label style="display:flex; align-items:center; gap:5px; font-size:0.85rem;">
+                <input type="checkbox" class="c-ptz" ${cam.ptz ? "checked" : ""}> PTZ
+            </label>
+            <label style="display:flex; align-items:center; gap:5px; font-size:0.85rem;">
+                <input type="checkbox" class="c-audio" ${cam.audio !== false ? "checked" : ""}> ${t("lbl_audio")}
+            </label>
+            <button onclick="this.parentElement.remove()" style="background:var(--danger); color:#fff; border:none;">🗑️</button>
+        `;
+        document.getElementById("cam-rows").appendChild(row);
+    }
+
+    function addUserRow(user = {}) {
+        const row = document.createElement("div");
+        row.className = "settings-row user-row-item";
+        row.innerHTML = `
+            <input type="text" placeholder="${t("ph_uname")}" class="u-name" value="${user.username || ""}">
+            <input type="password" placeholder="${t("ph_upwd")}" class="u-pwd" value="">
+            <select class="u-role">
+                <option value="admin" ${user.role === "admin" ? "selected" : ""}>Admin</option>
+                <option value="viewer" ${user.role === "viewer" ? "selected" : ""}>${t("role_viewer")}</option>
+            </select>
+            <button onclick="this.parentElement.remove()" style="background:var(--danger); color:#fff; border:none;">🗑️</button>
+        `;
+        document.getElementById("user-rows").appendChild(row);
+    }
+
+    async function saveSettings() {
+        const cameras = Array.from(document.querySelectorAll(".cam-row-item")).map(r => ({
+            name: r.querySelector(".c-name").value.trim(),
+            brand: r.querySelector(".c-brand").value,
+            ip: r.querySelector(".c-ip").value.trim(),
+            user: r.querySelector(".c-user").value.trim(),
+            password: r.querySelector(".c-pwd").value,
+            res: r.querySelector(".c-res").value,
+            mode: r.querySelector(".c-mode").value,
+            custom_path: r.querySelector(".c-path").value.trim(),
+            onvif_port: parseInt(r.querySelector(".c-onvif").value || "0", 10) || undefined,
+            mask_zones: r.querySelector(".c-mask").value.trim(),
+            ptz: r.querySelector(".c-ptz").checked,
+            audio: r.querySelector(".c-audio").checked
+        })).filter(c => c.ip !== "");
+
+        const users = Array.from(document.querySelectorAll(".user-row-item")).map(r => ({
+            username: r.querySelector(".u-name").value.trim(),
+            password: r.querySelector(".u-pwd").value,
+            role: r.querySelector(".u-role").value
+        })).filter(u => u.username !== "");
+
+        const payload = {
+            version: "0.1.0",
+            language: currentLang,
+            retention_days: parseInt(document.getElementById("cfg-retention").value || "7", 10),
+            segment_minutes: parseInt(document.getElementById("cfg-segment").value || "60", 10),
+            ntfy_topic: document.getElementById("cfg-ntfy").value.trim(),
+            ha_webhook: document.getElementById("cfg-ha").value.trim(),
+            cameras,
+            users
+        };
+
+        await fetch("/api/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+
+        closeSettings();
+        setTimeout(loadDashboard, 500);
+    }
+
+    // --- DONATE MODAL ---
+    function openDonate() {
+        document.getElementById("donate-modal").classList.add("active");
+    }
+
+    function closeDonate() {
+        document.getElementById("donate-modal").classList.remove("active");
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+        loadDashboard();
+        setInterval(loadDashboard, 10000);
+    });
+</script>
+</body>
+</html>
