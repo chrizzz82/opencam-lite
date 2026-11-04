@@ -23,7 +23,7 @@
 name: opencam-lite
 services:
   opencam-lite:
-    image: ghcr.io/chrizz82/opencam-lite:latest
+    image: ghcr.io/chrizzz82/opencam-lite:latest
     container_name: opencam-lite
     restart: unless-stopped
     network_mode: host
