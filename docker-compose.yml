@@ -1,10 +1,13 @@
+name: opencam-lite
 services:
   opencam-lite:
     build: .
+    image: opencam-lite:latest
     container_name: opencam-lite
     restart: unless-stopped
-    ports:
-      - "7777:7777"
+    network_mode: host
+    environment:
+      - TZ=Europe/Berlin
     volumes:
-      - /DATA/AppData/opencam-lite/config:/config
-      - /DATA/AppData/opencam-lite/recordings:/recordings
+      - ./config:/config
+      - ./recordings:/recordings
