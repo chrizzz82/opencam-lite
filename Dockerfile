@@ -1,22 +1,28 @@
 FROM python:3.11-slim
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    TZ=Europe/Berlin
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    tzdata \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
-COPY server.py /app/server.py
-COPY index.html /app/index.html
+# Systemabhängigkeiten für OpenCV und FFmpeg (RTSP/MP4-Verarbeitung)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /config /recordings /tmp/streams
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-EXPOSE 7777
+COPY . .
 
-CMD ["python3", "/app/server.py"]
+# Falls die HTML-Dateien im Hauptverzeichnis liegen, automatisch auch in templates/ verlinken
+RUN mkdir -p /app/templates /config /recordings && \
+    if [ -f /app/login.html ] && [ ! -f /app/templates/login.html ]; then cp /app/login.html /app/templates/login.html; fi && \
+    if [ -f /app/index.html ] && [ ! -f /app/templates/index.html ]; then cp /app/index.html /app/templates/index.html; fi
+
+ENV PYTHONUNBUFFERED=1
+ENV CONFIG_DIR=/config
+ENV RECORDINGS_DIR=/recordings
+
+EXPOSE 8080
+
+CMD ["python", "server.py"]

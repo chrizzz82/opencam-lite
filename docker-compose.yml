@@ -1,15 +1,17 @@
 name: opencam-lite
 services:
   opencam-lite:
-    image: ghcr.io/chrizz82/opencam-lite:latest
+    build: .
+    image: opencam-lite:latest
     container_name: opencam-lite
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8080:8080"
     environment:
       - TZ=Europe/Berlin
+      - SECRET_KEY=opencam_local_secret_key_change_if_needed
+      - CONFIG_DIR=/config
+      - RECORDINGS_DIR=/recordings
     volumes:
-      - ./config:/config
-      - ./recordings:/recordings
-    labels:
-      net.bigbear.casaos.name: "OpenCam Lite"
-      net.bigbear.casaOS.icon: "https://raw.githubusercontent.com/chrizzz82/opencam-lite/main/icon.png"
+      - /DATA/AppData/opencam-lite/config:/config
+      - /DATA/AppData/opencam-lite/recordings:/recordings

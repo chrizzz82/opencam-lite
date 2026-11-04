@@ -1,572 +1,533 @@
-#!/usr/bin/env python3
 import os
-import sys
-import json
+import io
+import re
+import cv2
 import time
-import shutil
+import json
+import uuid
+import base64
 import socket
-import signal
+import shutil
 import zipfile
-import tempfile
-import urllib.parse
-import urllib.request
-import subprocess
+import hashlib
 import threading
 import datetime
-import re
+import requests
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
+from functools import wraps
+from flask import (
+    Flask, Response, render_template, request, jsonify,
+    session, redirect, url_for, send_file, abort
+)
+from werkzeug.security import generate_password_hash, check_password_hash
 
-CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
-RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
-STREAMS_DIR = Path(os.environ.get("STREAMS_DIR", "/tmp/streams"))
-SETTINGS_FILE = CONFIG_DIR / "settings.json"
-PORT = int(os.environ.get("PORT", "7777"))
+# RTSP über TCP erzwingen und Timeout setzen (verhindert Hänger bei Tapo/Hikvision)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
 
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-STREAMS_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATE_DIR = "templates" if os.path.isdir("templates") and os.path.exists(os.path.join("templates", "index.html")) else "."
+app = Flask(__name__, template_folder=TEMPLATE_DIR)
+app.secret_key = os.environ.get("SECRET_KEY", "opencam_lite_secret_key_2026")
 
-DEFAULT_SETTINGS = {
-    "language": "de",
-    "retention_days": 7,
-    "segment_minutes": 15,
-    "ntfy_topic": "",
-    "ha_webhook": "",
-    "cameras": []
-}
+CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
+RECORDINGS_DIR = os.environ.get("RECORDINGS_DIR", "/recordings")
 
-BRAND_PRESETS = {
-    "tapo": {"hd": "/stream1", "sd": "/stream2", "port": 554, "onvif_port": 2020},
-    "reolink": {"hd": "/h264Preview_01_main", "sd": "/h264Preview_01_sub", "port": 554, "onvif_port": 8000},
-    "hikvision": {"hd": "/Streaming/Channels/101", "sd": "/Streaming/Channels/102", "port": 554, "onvif_port": 80},
-    "dahua": {"hd": "/cam/realmonitor?channel=1&subtype=0", "sd": "/cam/realmonitor?channel=1&subtype=1", "port": 554, "onvif_port": 80},
-    "amcrest": {"hd": "/cam/realmonitor?channel=1&subtype=0", "sd": "/cam/realmonitor?channel=1&subtype=1", "port": 554, "onvif_port": 80},
-    "foscam": {"hd": "/videoMain", "sd": "/videoSub", "port": 554, "onvif_port": 888},
-    "uniview": {"hd": "/media/video1", "sd": "/media/video2", "port": 554, "onvif_port": 80},
-    "axis": {"hd": "/axis-media/media.amp", "sd": "/axis-media/media.amp?resolution=640x480", "port": 554, "onvif_port": 80},
-    "generic": {"hd": "/stream1", "sd": "/stream2", "port": 554, "onvif_port": 80}
-}
+os.makedirs(CONFIG_DIR, exist_ok=True)
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
-settings_lock = threading.Lock()
-processes_lock = threading.Lock()
-camera_processes = {}
-stop_event = threading.Event()
+USERS_FILE = os.path.join(CONFIG_DIR, "users.json")
+CAMERAS_FILE = os.path.join(CONFIG_DIR, "cameras.json")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+
+config_lock = threading.Lock()
+workers_lock = threading.Lock()
+camera_workers = {}
 
 
-def sanitize_name(name: str) -> str:
-    clean = re.sub(r"[^a-zA-Z0-9_-]", "_", (name or "cam").strip())
-    return clean or "cam"
+# ==============================================================================
+# KONFIGURATION & PERSISTENZ
+# ==============================================================================
 
-
-def normalize_cameras(data: dict) -> bool:
-    changed = False
-    cams = data.get("cameras", [])
-    for idx, cam in enumerate(cams):
-        if not cam.get("id"):
-            cam["id"] = f"cam_{idx}_{sanitize_name(cam.get('name', f'cam{idx}'))}"
-            changed = True
-        if "quality" not in cam and "res" in cam:
-            cam["quality"] = "sd" if str(cam["res"]).lower() in ("sd", "sub", "low") else "hd"
-            changed = True
-        if "privacy_zones" not in cam and "mask_zones" in cam:
-            cam["privacy_zones"] = cam["mask_zones"]
-            changed = True
-    return changed
-
-
-def load_settings() -> dict:
-    with settings_lock:
-        if not SETTINGS_FILE.exists():
-            save_settings_unlocked(DEFAULT_SETTINGS)
-            return json.loads(json.dumps(DEFAULT_SETTINGS))
+def load_json(path, default):
+    with config_lock:
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(default, f, indent=4, ensure_ascii=False)
+            return default
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for k, v in DEFAULT_SETTINGS.items():
-                if k not in data:
-                    data[k] = v
-            if normalize_cameras(data):
-                save_settings_unlocked(data)
-            return data
-        except Exception as e:
-            print(f"[ERROR] Konnte settings.json nicht laden: {e}")
-            return json.loads(json.dumps(DEFAULT_SETTINGS))
-
-
-def save_settings_unlocked(data: dict):
-    normalize_cameras(data)
-    tmp_file = SETTINGS_FILE.with_suffix(".tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    tmp_file.replace(SETTINGS_FILE)
-
-
-def save_settings(data: dict):
-    with settings_lock:
-        save_settings_unlocked(data)
-
-
-def get_cam_record_base(cam: dict) -> Path:
-    safe_name = sanitize_name(cam.get("name") or cam.get("id") or "Kamera")
-    folder = RECORDINGS_DIR / safe_name
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
-
-
-def ensure_daily_folders_for_cam(cam: dict):
-    base = get_cam_record_base(cam)
-    now = datetime.datetime.now()
-    for delta in (-1, 0, 1, 2):
-        day_str = (now + datetime.timedelta(days=delta)).strftime("%Y-%m-%d")
-        (base / day_str).mkdir(parents=True, exist_ok=True)
-
-
-def ensure_all_daily_folders():
-    cfg = load_settings()
-    for cam in cfg.get("cameras", []):
-        try:
-            ensure_daily_folders_for_cam(cam)
-        except Exception as e:
-            print(f"[WARN] Fehler beim Erstellen der Tagesordner: {e}")
-
-
-def build_rtsp_url(cam: dict) -> str:
-    brand = (cam.get("brand") or "tapo").lower()
-    preset = BRAND_PRESETS.get(brand, BRAND_PRESETS["generic"])
-    ip = (cam.get("ip") or "").strip()
-    user = urllib.parse.quote(str(cam.get("user") or cam.get("username") or ""), safe="")
-    password = urllib.parse.quote(str(cam.get("password") or cam.get("pass") or ""), safe="")
-    quality = (cam.get("quality") or cam.get("res") or "hd").lower()
-    if quality in ("sub", "low"):
-        quality = "sd"
-    elif quality not in ("hd", "sd"):
-        quality = "hd"
-
-    custom_path = (cam.get("custom_path") or cam.get("path") or "").strip()
-    if custom_path:
-        if custom_path.startswith("rtsp://"):
-            return custom_path
-        path = custom_path if custom_path.startswith("/") else "/" + custom_path
-    else:
-        path = preset.get(quality, preset["hd"])
-
-    port = int(cam.get("port") or preset.get("port", 554))
-    auth = f"{user}:{password}@" if (user or password) else ""
-    return f"rtsp://{auth}{ip}:{port}{path}"
-
-
-def build_privacy_filter(cam: dict) -> str:
-    zones = cam.get("privacy_zones") or cam.get("mask_zones") or []
-    boxes = []
-    for z in zones:
-        try:
-            x = max(0.0, min(1.0, float(z.get("x", 0))))
-            y = max(0.0, min(1.0, float(z.get("y", 0))))
-            w = max(0.01, min(1.0 - x, float(z.get("w", 0))))
-            h = max(0.01, min(1.0 - y, float(z.get("h", 0))))
-            boxes.append(f"drawbox=x=iw*{x:.4f}:y=ih*{y:.4f}:w=iw*{w:.4f}:h=ih*{h:.4f}:color=black@1:t=fill")
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
-            continue
-    return ",".join(boxes)
+            return default
 
 
-def log_ffmpeg_errors(cam_name: str, proc: subprocess.Popen):
-    try:
-        if not proc.stderr:
-            return
-        for line in iter(proc.stderr.readline, b""):
-            msg = line.decode("utf-8", errors="ignore").strip()
-            if msg:
-                print(f"[FFMPEG {cam_name}] {msg}")
-    except Exception:
-        pass
+def save_json(path, data):
+    with config_lock:
+        temp_path = path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        os.replace(temp_path, path)
 
 
-def start_ffmpeg_for_cam(cam: dict, segment_minutes: int = 15, prev_restarts: int = 0):
-    cam_id = str(cam.get("id", ""))
-    ip = (cam.get("ip") or "").strip()
-    if not cam_id or not ip:
-        return
-
-    ensure_daily_folders_for_cam(cam)
-
-    stream_dir = STREAMS_DIR / cam_id
-    stream_dir.mkdir(parents=True, exist_ok=True)
-    for old_file in stream_dir.glob("*"):
-        try:
-            old_file.unlink()
-        except Exception:
-            pass
-
-    rtsp_url = build_rtsp_url(cam)
-    mode = (cam.get("mode") or "live").lower()
-    has_audio = bool(cam.get("audio", False))
-    privacy_vf = build_privacy_filter(cam)
-    segment_seconds = max(60, int(segment_minutes or 15) * 60)
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-fflags", "+genpts+discardcorrupt",
-        "-rtsp_transport", "tcp",
-        "-i", rtsp_url,
-    ]
-
-    cmd += ["-map", "0:v:0"]
-    if privacy_vf:
-        cmd += [
-            "-vf", privacy_vf,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p"
-        ]
-    else:
-        cmd += ["-c:v", "copy"]
-
-    if has_audio:
-        cmd += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "64k"]
-    else:
-        cmd += ["-an"]
-
-    hls_playlist = str(stream_dir / "index.m3u8")
-    hls_segment_pattern = str(stream_dir / "seg_%03d.ts")
-    cmd += [
-        "-f", "hls",
-        "-hls_time", "2",
-        "-hls_list_size", "6",
-        "-hls_flags", "delete_segments+independent_segments",
-        "-hls_segment_filename", hls_segment_pattern,
-        hls_playlist
-    ]
-
-    if mode in ("always", "24/7", "record", "motion"):
-        cam_base = get_cam_record_base(cam)
-        out_pattern = str(cam_base / "%Y-%m-%d" / "%H-%M-%S.mp4")
-
-        cmd += ["-map", "0:v:0"]
-        if privacy_vf:
-            cmd += [
-                "-vf", privacy_vf,
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-pix_fmt", "yuv420p"
-            ]
-        else:
-            cmd += ["-c:v", "copy"]
-
-        if has_audio:
-            cmd += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "64k"]
-        else:
-            cmd += ["-an"]
-
-        cmd += [
-            "-f", "segment",
-            "-segment_time", str(segment_seconds),
-            "-segment_atclocktime", "1",
-            "-reset_timestamps", "1",
-            "-strftime", "1",
-            out_pattern
-        ]
-
-    cam_name = cam.get("name", cam_id)
-    print(f"[STREAM] Starte Kamera '{cam_name}' ({ip}) | Modus: {mode} | Reconnects: {prev_restarts}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        start_new_session=True
-    )
-
-    threading.Thread(target=log_ffmpeg_errors, args=(cam_name, proc), daemon=True).start()
-
-    with processes_lock:
-        camera_processes[cam_id] = {
-            "proc": proc,
-            "started_at": time.time(),
-            "restarts": prev_restarts,
-            "cam_cfg": json.loads(json.dumps(cam)),
-            "segment_minutes": segment_minutes
+def init_configs():
+    if not os.path.exists(USERS_FILE):
+        default_users = {
+            "admin": {
+                "password_hash": generate_password_hash("admin"),
+                "role": "admin",
+                "created_at": datetime.datetime.now().isoformat()
+            }
         }
+        save_json(USERS_FILE, default_users)
+
+    if not os.path.exists(CAMERAS_FILE):
+        save_json(CAMERAS_FILE, [])
+
+    default_settings = {
+        "language": "en",
+        "recording_interval": 15,  # 15 bis 120 Minuten
+        "retention_days": 7,
+        "motion_post_buffer": 15,  # Sekunden Nachlauf bei Bewegung
+        "ntfy_url": "",
+        "ha_webhook_url": "",
+        "alert_cooldown": 60
+    }
+    current_settings = load_json(SETTINGS_FILE, default_settings)
+    for k, v in default_settings.items():
+        if k not in current_settings:
+            current_settings[k] = v
+    save_json(SETTINGS_FILE, current_settings)
 
 
-def stop_ffmpeg_for_cam(cam_id: str):
-    cam_id = str(cam_id)
-    with processes_lock:
-        info = camera_processes.pop(cam_id, None)
-    if info and info.get("proc"):
-        proc = info["proc"]
-        try:
-            if proc.poll() is None:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+init_configs()
 
 
-def sync_all_cameras():
-    cfg = load_settings()
-    seg_mins = int(cfg.get("segment_minutes", 15))
-    cams = cfg.get("cameras", [])
-    active_ids = {str(c.get("id")) for c in cams if c.get("id")}
-
-    with processes_lock:
-        running_ids = set(camera_processes.keys())
-
-    for cid in running_ids - active_ids:
-        stop_ffmpeg_for_cam(cid)
-
-    for cam in cams:
-        cid = str(cam.get("id"))
-        if not cid:
-            continue
-        with processes_lock:
-            existing = camera_processes.get(cid)
-        if not existing:
-            start_ffmpeg_for_cam(cam, seg_mins, prev_restarts=0)
-        else:
-            if existing.get("cam_cfg") != cam or existing.get("segment_minutes") != seg_mins:
-                restarts = existing.get("restarts", 0)
-                stop_ffmpeg_for_cam(cid)
-                start_ffmpeg_for_cam(cam, seg_mins, prev_restarts=restarts)
-
-
-def get_stream_last_activity(cam_id: str) -> float:
-    stream_dir = STREAMS_DIR / str(cam_id)
-    if not stream_dir.exists():
-        return 0.0
-    latest = 0.0
-    for f in stream_dir.glob("*"):
-        try:
-            mtime = f.stat().st_mtime
-            if mtime > latest:
-                latest = mtime
-        except Exception:
-            pass
-    return latest
-
-
-def watchdog_and_maintenance_loop():
-    last_cleanup = 0.0
-    last_folder_prep = 0.0
-
-    while not stop_event.is_set():
-        now = time.time()
-
-        if now - last_folder_prep > 600:
-            ensure_all_daily_folders()
-            last_folder_prep = now
-
-        if now - last_cleanup > 3600:
-            cleanup_old_recordings()
-            last_cleanup = now
-
-        cfg = load_settings()
-        seg_mins = int(cfg.get("segment_minutes", 15))
-        cam_map = {str(c.get("id")): c for c in cfg.get("cameras", []) if c.get("id")}
-
-        for cid, cam in cam_map.items():
-            if not (cam.get("ip") or "").strip():
-                continue
-            with processes_lock:
-                info = camera_processes.get(cid)
-
-            if not info:
-                start_ffmpeg_for_cam(cam, seg_mins, prev_restarts=0)
-                continue
-
-            proc = info.get("proc")
-            started_at = info.get("started_at", now)
-            restarts = info.get("restarts", 0)
-
-            needs_restart = False
-            reason = ""
-
-            if proc is None or proc.poll() is not None:
-                needs_restart = True
-                code = proc.returncode if proc else "None"
-                reason = f"FFmpeg beendet (Code {code})"
-            else:
-                uptime = now - started_at
-                if uptime > 25:
-                    last_act = get_stream_last_activity(cid)
-                    if last_act == 0.0 or (now - last_act) > 25:
-                        needs_restart = True
-                        reason = "Keine Pakete seit >25s (Kamera-Reboot erkannt)"
-
-            if needs_restart:
-                print(f"[WATCHDOG] '{cam.get('name', cid)}': {reason} -> Reconnect in 8s...")
-                stop_ffmpeg_for_cam(cid)
-                if stop_event.wait(8):
-                    break
-                ensure_daily_folders_for_cam(cam)
-                start_ffmpeg_for_cam(cam, seg_mins, prev_restarts=restarts + 1)
-
-        if stop_event.wait(8):
-            break
+def ensure_daily_folders():
+    """Erstellt die YYYY-MM-DD Ordner für heute und morgen vorab (verhindert Mitternachts-Fehler)."""
+    now = datetime.datetime.now()
+    for delta in (0, 1):
+        day_str = (now + datetime.timedelta(days=delta)).strftime("%Y-%m-%d")
+        day_path = os.path.join(RECORDINGS_DIR, day_str)
+        os.makedirs(day_path, exist_ok=True)
 
 
 def cleanup_old_recordings():
-    cfg = load_settings()
-    retention_days = int(cfg.get("retention_days", 7))
+    """Löscht Tagesordner, die älter als retention_days sind."""
+    settings = load_json(SETTINGS_FILE, {})
+    retention_days = int(settings.get("retention_days", 7))
     if retention_days <= 0:
         return
-    cutoff = time.time() - (retention_days * 86400)
+    cutoff = datetime.date.today() - datetime.timedelta(days=retention_days)
     try:
-        for mp4 in RECORDINGS_DIR.rglob("*.mp4"):
-            try:
-                if mp4.stat().st_mtime < cutoff:
-                    mp4.unlink()
-            except Exception:
-                pass
-        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-        tomorrow_str = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        for folder in sorted(RECORDINGS_DIR.rglob("*"), key=lambda p: len(str(p)), reverse=True):
-            if folder.is_dir() and folder.name not in (today_str, tomorrow_str):
+        for entry in os.listdir(RECORDINGS_DIR):
+            entry_path = os.path.join(RECORDINGS_DIR, entry)
+            if os.path.isdir(entry_path) and re.match(r"^\d{4}-\d{2}-\d{2}$", entry):
                 try:
-                    if not any(folder.iterdir()):
-                        folder.rmdir()
-                except Exception:
+                    folder_date = datetime.datetime.strptime(entry, "%Y-%m-%d").date()
+                    if folder_date < cutoff:
+                        shutil.rmtree(entry_path, ignore_errors=True)
+                except ValueError:
                     pass
     except Exception as e:
-        print(f"[WARN] Aufräumen fehlgeschlagen: {e}")
+        print(f"[Cleanup] Fehler: {e}")
 
 
-def list_all_recordings():
-    items = []
-    if not RECORDINGS_DIR.exists():
-        return items
+# ==============================================================================
+# BENACHRICHTIGUNGEN (NTFY.SH & HOME ASSISTANT WEBHOOK)
+# ==============================================================================
 
-    for mp4 in RECORDINGS_DIR.rglob("*.mp4"):
+def trigger_motion_alert(cam_name, cam_id):
+    settings = load_json(SETTINGS_FILE, {})
+    ntfy_url = settings.get("ntfy_url", "").strip()
+    ha_url = settings.get("ha_webhook_url", "").strip()
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if ntfy_url:
         try:
-            stat = mp4.stat()
-            if stat.st_size < 16384 and (time.time() - stat.st_mtime) < 5:
+            requests.post(
+                ntfy_url,
+                data=f"Bewegung erkannt: {cam_name} ({timestamp})".encode("utf-8"),
+                headers={"Title": f"OpenCam Alert: {cam_name}", "Priority": "high"},
+                timeout=4
+            )
+        except Exception as e:
+            print(f"[Alert] ntfy Fehler: {e}")
+
+    if ha_url:
+        try:
+            requests.post(
+                ha_url,
+                json={"camera_id": cam_id, "camera_name": cam_name, "event": "motion", "timestamp": timestamp},
+                timeout=4
+            )
+        except Exception as e:
+            print(f"[Alert] Home Assistant Webhook Fehler: {e}")
+
+
+# ==============================================================================
+# SINGLE RTSP CONNECTION WORKER (LIVE + MOTION + 24/7 + WATCHDOG)
+# ==============================================================================
+
+class CameraStreamWorker:
+    def __init__(self, cam_config):
+        self.config = cam_config
+        self.cam_id = cam_config["id"]
+        self.running = True
+        self.lock = threading.Lock()
+        self.latest_jpeg = None
+        self.latest_raw_shape = (720, 1280)
+        self.last_frame_time = time.time()
+        self.connected = False
+        self.motion_detected = False
+        self.last_motion_time = 0
+        self.last_alert_time = 0
+
+        # VideoWriter Status
+        self.writer = None
+        self.current_rec_start = 0
+        self.current_rec_date = ""
+        self.current_rec_mode = ""
+
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+
+    def update_config(self, new_config):
+        with self.lock:
+            rtsp_changed = self.config.get("rtsp_url") != new_config.get("rtsp_url")
+            self.config = new_config
+            if rtsp_changed:
+                # Erzwingt Reconnect durch Zurücksetzen des Watchdog-Timers
+                self.last_frame_time = 0
+
+    def stop(self):
+        self.running = False
+        self._close_writer()
+
+    def get_jpeg(self):
+        with self.lock:
+            if self.latest_jpeg is not None:
+                return self.latest_jpeg
+        return self._generate_placeholder_jpeg("Verbinde Kamera...")
+
+    def _generate_placeholder_jpeg(self, text):
+        img = np.zeros((480, 854, 3), dtype=np.uint8)
+        img[:] = (22, 24, 29)
+        cv2.putText(img, self.config.get("name", "Camera"), (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (220, 220, 220), 2)
+        cv2.putText(img, text, (30, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (140, 150, 165), 2)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cv2.putText(img, ts, (30, 440),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 110, 120), 1)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        return buf.tobytes() if ok else b""
+
+    def _apply_privacy_zones(self, frame, privacy_zones):
+        if not privacy_zones:
+            return
+        h, w = frame.shape[:2]
+        for z in privacy_zones:
+            try:
+                x1 = max(0, int(float(z["x"]) * w))
+                y1 = max(0, int(float(z["y"]) * h))
+                x2 = min(w, int((float(z["x"]) + float(z["w"])) * w))
+                y2 = min(h, int((float(z["y"]) + float(z["h"])) * h))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
+            except Exception:
+                pass
+
+    def _detect_motion(self, prev_gray, curr_gray, motion_zones, sensitivity):
+        if prev_gray is None or prev_gray.shape != curr_gray.shape:
+            return False
+        diff = cv2.absdiff(prev_gray, curr_gray)
+        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+
+        h, w = thresh.shape[:2]
+        if motion_zones:
+            mask = np.zeros((h, w), dtype=np.uint8)
+            for z in motion_zones:
+                try:
+                    x1 = max(0, int(float(z["x"]) * w))
+                    y1 = max(0, int(float(z["y"]) * h))
+                    x2 = min(w, int((float(z["x"]) + float(z["w"])) * w))
+                    y2 = min(h, int((float(z["y"]) + float(z["h"])) * h))
+                    cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+                except Exception:
+                    pass
+            thresh = cv2.bitwise_and(thresh, mask)
+
+        changed_pixels = cv2.countNonZero(thresh)
+        total_pixels = float(h * w)
+        # Sensitivität 1 (unempfindlich) bis 100 (sehr empfindlich)
+        sens = max(1, min(100, int(sensitivity or 50)))
+        required_ratio = 0.05 * ((101 - sens) / 100.0) * 0.5 + 0.0005
+        return (changed_pixels / total_pixels) >= required_ratio
+
+    def _close_writer(self):
+        if self.writer is not None:
+            try:
+                self.writer.release()
+            except Exception:
+                pass
+            self.writer = None
+
+    def _handle_recording(self, frame, fps):
+        settings = load_json(SETTINGS_FILE, {})
+        interval_min = int(settings.get("recording_interval", 15))
+        interval_min = max(15, min(120, interval_min))
+        interval_sec = interval_min * 60
+        post_buffer = int(settings.get("motion_post_buffer", 15))
+
+        mode = self.config.get("recording_mode", "live")
+        now = time.time()
+        dt_now = datetime.datetime.now()
+        today_str = dt_now.strftime("%Y-%m-%d")
+
+        should_record = False
+        if mode == "24/7":
+            should_record = True
+        elif mode == "motion":
+            if self.motion_detected or (now - self.last_motion_time <= post_buffer):
+                should_record = True
+
+        if not should_record:
+            self._close_writer()
+            return
+
+        # Neue Datei starten, wenn kein Writer offen, Tageswechsel (Mitternacht) oder Intervall (15-120 Min) erreicht
+        if (
+            self.writer is None
+            or self.current_rec_date != today_str
+            or (now - self.current_rec_start) >= interval_sec
+        ):
+            self._close_writer()
+            ensure_daily_folders()
+            day_folder = os.path.join(RECORDINGS_DIR, today_str)
+            os.makedirs(day_folder, exist_ok=True)
+
+            safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", self.config.get("name", "Cam"))
+            time_str = dt_now.strftime("%H-%M-%S")
+            tag = "MOTION" if mode == "motion" else "24x7"
+            filename = f"{self.cam_id}__{safe_name}__{time_str}__{tag}.mp4"
+            filepath = os.path.join(day_folder, filename)
+
+            h, w = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out_fps = max(5.0, min(30.0, float(fps if fps and fps > 0 else 15.0)))
+            self.writer = cv2.VideoWriter(filepath, fourcc, out_fps, (w, h))
+            self.current_rec_start = now
+            self.current_rec_date = today_str
+            self.current_rec_mode = mode
+
+        if self.writer is not None and self.writer.isOpened():
+            self.writer.write(frame)
+
+    def _run_loop(self):
+        cap = None
+        prev_gray = None
+        fps_estimate = 15.0
+
+        while self.running:
+            rtsp_url = self.config.get("rtsp_url", "").strip()
+            if not rtsp_url:
+                self.connected = False
+                with self.lock:
+                    self.latest_jpeg = self._generate_placeholder_jpeg("Keine RTSP-URL konfiguriert")
+                time.sleep(2)
                 continue
-            rel_path = mp4.relative_to(RECORDINGS_DIR).as_posix()
-            parts = rel_path.split("/")
 
-            cam_name = parts[0] if len(parts) > 1 else "Kamera"
-            date_str = None
-            for p in parts:
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", p):
-                    date_str = p
-                    break
-            if not date_str:
-                date_str = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d")
+            # Watchdog: Prüft auf Verbindungsabbruch oder > 25 Sekunden ohne Frame
+            if cap is None or not cap.isOpened() or (time.time() - self.last_frame_time > 25.0):
+                self.connected = False
+                self._close_writer()
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                with self.lock:
+                    self.latest_jpeg = self._generate_placeholder_jpeg("Verbinde Stream (Watchdog)...")
+                try:
+                    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    cap = None
+                if cap is None or not cap.isOpened():
+                    time.sleep(3)
+                    continue
+                self.last_frame_time = time.time()
+                prev_gray = None
 
-            items.append({
-                "filename": mp4.name,
-                "rel_path": rel_path,
-                "url": f"/recordings/{urllib.parse.quote(rel_path)}",
-                "cam_name": cam_name,
-                "date": date_str,
-                "size_mb": round(stat.st_size / (1024 * 1024), 2),
-                "timestamp": int(stat.st_mtime),
-                "time_str": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%H:%M:%S")
-            })
-        except Exception:
-            continue
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                # Wenn länger als 25 Sekunden kein Frame kam, schlägt der Watchdog oben zu
+                time.sleep(0.1)
+                continue
 
-    items.sort(key=lambda x: x["timestamp"], reverse=True)
-    return items
+            now = time.time()
+            self.last_frame_time = now
+            self.connected = True
+            self.latest_raw_shape = frame.shape[:2]
+
+            cam_fps = cap.get(cv2.CAP_PROP_FPS)
+            if cam_fps and 1.0 <= cam_fps <= 60.0:
+                fps_estimate = cam_fps
+
+            with self.lock:
+                privacy_zones = list(self.config.get("privacy_zones", []))
+                motion_zones = list(self.config.get("motion_zones", []))
+                sensitivity = self.config.get("motion_sensitivity", 50)
+                cam_name = self.config.get("name", "Camera")
+
+            # 1. Privacy Zones permanent schwärzen (vor Live-Stream UND vor Aufnahme)
+            self._apply_privacy_zones(frame, privacy_zones)
+
+            # 2. Bewegungserkennung berechnen
+            small = cv2.resize(frame, (320, 180))
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (9, 9), 0)
+
+            is_moving = self._detect_motion(prev_gray, gray, motion_zones, sensitivity)
+            prev_gray = gray
+            self.motion_detected = is_moving
+
+            if is_moving:
+                self.last_motion_time = now
+                settings = load_json(SETTINGS_FILE, {})
+                cooldown = int(settings.get("alert_cooldown", 60))
+                if now - self.last_alert_time >= cooldown:
+                    self.last_alert_time = now
+                    threading.Thread(
+                        target=trigger_motion_alert,
+                        args=(cam_name, self.cam_id),
+                        daemon=True
+                    ).start()
+
+            # 3. Zeitstempel in Frame einbrennen
+            ts_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cv2.putText(frame, f"{cam_name} | {ts_str}", (16, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3)
+            cv2.putText(frame, f"{cam_name} | {ts_str}", (16, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
+
+            # 4. Aufnahme verarbeiten (Live / Motion / 24/7)
+            try:
+                self._handle_recording(frame, fps_estimate)
+            except Exception as e:
+                print(f"[Recording] Fehler bei {cam_name}: {e}")
+
+            # 5. JPEG für Live-Stream & Sofort-Snapshots aktualisieren
+            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ok:
+                with self.lock:
+                    self.latest_jpeg = buffer.tobytes()
+
+        self._close_writer()
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
 
-def check_port(ip: str, port: int, timeout: float = 0.28) -> bool:
-    try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
-    except Exception:
-        return False
+def sync_camera_workers():
+    cameras = load_json(CAMERAS_FILE, [])
+    active_ids = set()
+    with workers_lock:
+        for cam in cameras:
+            cid = cam["id"]
+            active_ids.add(cid)
+            if cid in camera_workers:
+                camera_workers[cid].update_config(cam)
+            else:
+                camera_workers[cid] = CameraStreamWorker(cam)
+
+        for cid in list(camera_workers.keys()):
+            if cid not in active_ids:
+                camera_workers[cid].stop()
+                del camera_workers[cid]
 
 
-def probe_single_ip(ip: str):
-    if check_port(ip, 2020, 0.28):
-        return {"ip": ip, "brand": "tapo", "name": f"Tapo ({ip})"}
-    if check_port(ip, 554, 0.28):
-        if check_port(ip, 8000, 0.2):
-            return {"ip": ip, "brand": "reolink", "name": f"Reolink ({ip})"}
-        if check_port(ip, 888, 0.2):
-            return {"ip": ip, "brand": "foscam", "name": f"Foscam ({ip})"}
-        return {"ip": ip, "brand": "tapo", "name": f"Kamera ({ip})"}
-    return None
+def background_housekeeping():
+    while True:
+        try:
+            ensure_daily_folders()
+            cleanup_old_recordings()
+        except Exception as e:
+            print(f"[Housekeeping] Fehler: {e}")
+        time.sleep(1800)
 
 
-def detect_lan_prefixes(hint_host: str = "") -> list:
-    prefixes = []
-    def add_ip_prefix(ip_str: str):
-        ip_clean = (ip_str or "").split(":")[0].strip()
-        m = re.match(r"^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$", ip_clean)
-        if m:
-            pref = m.group(1)
-            if not pref.startswith(("127.", "172.17.", "172.18.", "172.19.")):
-                if pref not in prefixes:
-                    prefixes.append(pref)
+sync_camera_workers()
+threading.Thread(target=background_housekeeping, daemon=True).start()
 
-    add_ip_prefix(hint_host)
-    try:
-        cfg = load_settings()
-        for c in cfg.get("cameras", []):
-            add_ip_prefix(c.get("ip", ""))
-    except Exception:
-        pass
 
+# ==============================================================================
+# HYBRID ONVIF SCANNER (MULTICAST + PARALLELER TCP-SCAN AB .2 BIS .254)
+# ==============================================================================
+
+def get_local_subnet_prefix():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        add_ip_prefix(s.getsockname()[0])
+        ip = s.getsockname()[0]
         s.close()
+        parts = ip.split(".")
+        if len(parts) == 4 and not ip.startswith("172.17."):
+            return f"{parts[0]}.{parts[1]}.{parts[2]}"
     except Exception:
         pass
-
-    if not prefixes:
-        prefixes.append("192.168.178")
-    return prefixes[:2]
+    return "192.168.178"
 
 
-def discover_onvif_devices(hint_host: str = "") -> list:
-    found_ips = {}
-    ws_discovery_msg = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" '
-        'xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
-        'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" '
-        'xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
-        '<e:Header>'
-        '<w:MessageID>uuid:84ede3de-7dec-11d0-c360-f01234567890</w:MessageID>'
-        '<w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>'
-        '<w:Action a:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>'
-        '</e:Header>'
-        '<e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body>'
-        '</e:Envelope>'
-    ).encode("utf-8")
+def is_router_ip(ip_str):
+    """Filtert strikt .1 (Router/Gateway) und ungültige IPs heraus."""
+    parts = ip_str.strip().split(".")
+    if len(parts) != 4:
+        return True
+    try:
+        last_octet = int(parts[3])
+        return last_octet < 2 or last_octet > 254
+    except ValueError:
+        return True
+
+
+def ws_discovery_scan(timeout=2.0):
+    discovered_ips = set()
+    probe_id = str(uuid.uuid4())
+    probe_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+                xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+                xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
+                xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
+        <e:Header>
+            <w:MessageID>uuid:{probe_id}</w:MessageID>
+            <w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>
+            <w:Action a:mustUnderstand="true" xmlns:a="http://www.w3.org/2005/08/addressing">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
+        </e:Header>
+        <e:Body>
+            <d:Probe>
+                <d:Types>dn:NetworkVideoTransmitter</d:Types>
+            </d:Probe>
+        </e:Body>
+    </e:Envelope>"""
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(0.9)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.settimeout(timeout)
     try:
-        sock.sendto(ws_discovery_msg, ("239.255.255.250", 3702))
+        sock.sendto(probe_xml.encode("utf-8"), ("239.255.255.250", 3702))
         start = time.time()
-        while time.time() - start < 0.9:
+        while time.time() - start < timeout:
             try:
                 data, addr = sock.recvfrom(65535)
-                ip = addr[0]
-                text = data.decode("utf-8", errors="ignore").lower()
-                brand = "generic"
-                for b in ("tapo", "tp-link", "reolink", "hikvision", "dahua", "amcrest", "foscam", "axis", "uniview"):
-                    if b in text:
-                        brand = "tapo" if b == "tp-link" else b
-                        break
-                found_ips[ip] = {"ip": ip, "brand": brand, "name": f"{brand.capitalize()} ({ip})"}
+                sender_ip = addr[0]
+                if not is_router_ip(sender_ip):
+                    discovered_ips.add(sender_ip)
+                text = data.decode("utf-8", errors="ignore")
+                for match in re.findall(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", text):
+                    if not is_router_ip(match):
+                        discovered_ips.add(match)
             except socket.timeout:
                 break
             except Exception:
@@ -575,33 +536,118 @@ def discover_onvif_devices(hint_host: str = "") -> list:
         pass
     finally:
         sock.close()
+    return discovered_ips
 
-    prefixes = detect_lan_prefixes(hint_host)
-    candidate_ips = [f"{pref}.{i}" for pref in prefixes for i in range(2, 255) if f"{pref}.{i}" not in found_ips]
 
+def probe_host_ports(ip):
+    """Prüft typische Kamera-Ports (RTSP 554, Tapo ONVIF 2020, Hikvision 8000, ONVIF 8899/8080)."""
+    if is_router_ip(ip):
+        return None
+
+    ports_to_check = [554, 2020, 8000, 8899, 8554]
+    open_ports = []
+    for port in ports_to_check:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.35)
+        try:
+            if s.connect_ex((ip, port)) == 0:
+                open_ports.append(port)
+        except Exception:
+            pass
+        finally:
+            s.close()
+
+    if not open_ports:
+        return None
+
+    brand = "generic"
+    onvif_port = 80
+    rtsp_path = "/stream1"
+    label = "ONVIF / RTSP Camera"
+
+    if 2020 in open_ports:
+        brand = "tapo"
+        onvif_port = 2020
+        rtsp_path = "/stream1"
+        label = "TP-Link Tapo Camera"
+    elif 8000 in open_ports:
+        brand = "hikvision"
+        onvif_port = 80
+        rtsp_path = "/Streaming/Channels/101"
+        label = "Hikvision Camera"
+    elif 8899 in open_ports:
+        brand = "onvif"
+        onvif_port = 8899
+        rtsp_path = "/live/ch0"
+        label = "ONVIF Camera"
+
+    return {
+        "ip": ip,
+        "brand": brand,
+        "name": f"{label} ({ip})",
+        "open_ports": open_ports,
+        "onvif_port": onvif_port,
+        "suggested_rtsp": f"rtsp://admin:password@{ip}:554{rtsp_path}"
+    }
+
+
+def hybrid_network_scan(subnet_prefix=None):
+    if not subnet_prefix or not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$", subnet_prefix.strip()):
+        subnet_prefix = get_local_subnet_prefix()
+    subnet_prefix = subnet_prefix.strip()
+
+    ws_ips = ws_discovery_scan(timeout=1.5)
+    # Strikt ab .2 bis .254 scannen (Router auf .1 wird ausgeschlossen!)
+    target_ips = [f"{subnet_prefix}.{i}" for i in range(2, 255)]
+    for wip in ws_ips:
+        if not is_router_ip(wip) and wip not in target_ips:
+            target_ips.append(wip)
+
+    results = []
     with ThreadPoolExecutor(max_workers=64) as executor:
-        futures = {executor.submit(probe_single_ip, ip): ip for ip in candidate_ips}
-        for fut in as_completed(futures):
-            try:
-                res = fut.result()
-                if res:
-                    found_ips[res["ip"]] = res
-            except Exception:
-                pass
+        futures = {executor.submit(probe_host_ports, ip): ip for ip in target_ips}
+        for future in as_completed(futures):
+            res = future.result()
+            if res is not None:
+                results.append(res)
 
-    return sorted(found_ips.values(), key=lambda x: [int(p) for p in x["ip"].split(".")])
+    results.sort(key=lambda x: [int(p) for p in x["ip"].split(".")])
+    return results
 
 
-def send_onvif_ptz(cam: dict, action: str, direction: str = "", speed: float = 0.5) -> bool:
-    ip = cam.get("ip")
+# ==============================================================================
+# SIGNED TAPO & ONVIF PTZ (WS-SECURITY DIGEST AUTHENTICATION)
+# ==============================================================================
+
+def build_wsse_header(username, password):
+    nonce_raw = os.urandom(16)
+    created = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    digest = hashlib.sha1(nonce_raw + created.encode("utf-8") + password.encode("utf-8")).digest()
+    password_digest = base64.b64encode(digest).decode("utf-8")
+    nonce_b64 = base64.b64encode(nonce_raw).decode("utf-8")
+
+    return f"""
+    <s:Header>
+        <Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+            <UsernameToken>
+                <Username>{username}</Username>
+                <Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{password_digest}</Password>
+                <Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce_b64}</Nonce>
+                <Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{created}</Created>
+            </UsernameToken>
+        </Security>
+    </s:Header>"""
+
+
+def execute_onvif_ptz(cam, direction, speed=0.5):
+    ip = cam.get("ip", "").strip()
+    port = int(cam.get("onvif_port", 2020) or 2020)
+    user = cam.get("username", "admin")
+    password = cam.get("password", "")
+    profile_token = cam.get("profile_token", "profile_1")
+
     if not ip:
-        return False
-    brand = (cam.get("brand") or "tapo").lower()
-    onvif_port = BRAND_PRESETS.get(brand, BRAND_PRESETS["generic"]).get("onvif_port", 2020)
-    url = f"http://{ip}:{onvif_port}/onvif/ptz_service"
-
-    user = str(cam.get("user") or cam.get("username") or "").strip()
-    password = str(cam.get("password") or cam.get("pass") or "").strip()
+        return False, "Keine Kamera-IP hinterlegt"
 
     vx, vy, vz = 0.0, 0.0, 0.0
     if direction == "left":
@@ -612,323 +658,546 @@ def send_onvif_ptz(cam: dict, action: str, direction: str = "", speed: float = 0
         vy = speed
     elif direction == "down":
         vy = -speed
+    elif direction == "zoom_in":
+        vz = speed
+    elif direction == "zoom_out":
+        vz = -speed
 
-    if action == "stop" or direction == "stop":
-        body = (
-            '<?xml version="1.0" encoding="utf-8"?>'
-            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
-            'xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">'
-            '<s:Body><tptz:Stop><tptz:ProfileToken>000</tptz:ProfileToken>'
-            '<tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom></tptz:Stop></s:Body></s:Envelope>'
-        )
+    wsse = build_wsse_header(user, password)
+
+    if direction == "stop":
+        body = f"""
+        <s:Body xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+            <Stop xmlns="http://www.onvif.org/ver20/ptz/wsdl">
+                <ProfileToken>{profile_token}</ProfileToken>
+                <PanTilt>true</PanTilt>
+                <Zoom>true</Zoom>
+            </Stop>
+        </s:Body>"""
     else:
-        body = (
-            '<?xml version="1.0" encoding="utf-8"?>'
-            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
-            'xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" '
-            'xmlns:tt="http://www.onvif.org/ver10/schema">'
-            '<s:Body><tptz:ContinuousMove><tptz:ProfileToken>000</tptz:ProfileToken>'
-            f'<tptz:Velocity><tt:PanTilt x="{vx}" y="{vy}" space="http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace"/></tt:Velocity>'
-            '</tptz:ContinuousMove></s:Body></s:Envelope>'
-        )
+        body = f"""
+        <s:Body xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+            <ContinuousMove xmlns="http://www.onvif.org/ver20/ptz/wsdl">
+                <ProfileToken>{profile_token}</ProfileToken>
+                <Velocity>
+                    <PanTilt x="{vx}" y="{vy}" xmlns="http://www.onvif.org/ver10/schema"/>
+                    <Zoom x="{vz}" xmlns="http://www.onvif.org/ver10/schema"/>
+                </Velocity>
+            </ContinuousMove>
+        </s:Body>"""
 
-    headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
-    req = urllib.request.Request(url, data=body.encode("utf-8"), headers=headers, method="POST")
-    if user and password:
-        pass_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-        pass_mgr.add_password(None, url, user, password)
-        auth_handler = urllib.request.HTTPDigestAuthHandler(pass_mgr)
-        opener = urllib.request.build_opener(auth_handler)
+    envelope = f'<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">{wsse}{body}</s:Envelope>'
+    endpoints = [
+        f"http://{ip}:{port}/onvif/ptz_service",
+        f"http://{ip}:{port}/onvif/device_service",
+        f"http://{ip}:2020/onvif/ptz_service"
+    ]
+
+    for url in endpoints:
         try:
-            opener.open(req, timeout=3)
-            return True
+            resp = requests.post(
+                url,
+                data=envelope.encode("utf-8"),
+                headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+                timeout=2.5
+            )
+            if resp.status_code < 400:
+                if direction != "stop":
+                    # Automatischer Stopp nach 450ms für saubere Schrittsteuerung
+                    threading.Timer(0.45, execute_onvif_ptz, args=(cam, "stop", 0)).start()
+                return True, "OK"
         except Exception:
-            return False
+            continue
 
-    try:
-        with urllib.request.urlopen(req, timeout=3):
-            return True
-    except Exception:
-        return False
+    return False, "PTZ-Endpunkt antwortet nicht"
 
 
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
+# ==============================================================================
+# AUTHENTIFIZIERUNG & ROLLEN-DEKORATOREN (ADMIN vs. READONLY)
+# ==============================================================================
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user" not in session:
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Nicht angemeldet"}), 401
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
 
 
-class RequestHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        if self.path.startswith("/stream/"):
-            return
-        sys.stdout.write(f"[HTTP] {self.address_string()} - {format % args}\n")
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user" not in session:
+            return jsonify({"error": "Nicht angemeldet"}), 401
+        if session.get("role") != "admin":
+            return jsonify({"error": "Keine Berechtigung (Nur für Administratoren)"}), 403
+        return f(*args, **kwargs)
+    return decorated
 
-    def send_json(self, data, status=200):
-        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(raw)
 
-    def serve_file_with_range(self, file_path: Path, content_type: str, as_attachment: bool = False):
-        if not file_path.exists() or not file_path.is_file():
-            self.send_error(404, "File not found")
-            return
-        file_size = file_path.stat().st_size
-        range_header = self.headers.get("Range")
+# ==============================================================================
+# ROUTEN: LOGIN & HAUPTSEITE
+# ==============================================================================
 
-        if range_header and range_header.startswith("bytes="):
-            try:
-                ranges = range_header.replace("bytes=", "").split("-")
-                start = int(ranges[0]) if ranges[0] else 0
-                end = int(ranges[1]) if (len(ranges) > 1 and ranges[1]) else file_size - 1
-                end = min(end, file_size - 1)
-                length = end - start + 1
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    settings = load_json(SETTINGS_FILE, {})
+    lang = settings.get("language", "en")
 
-                self.send_response(206)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Accept-Ranges", "bytes")
-                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-                self.send_header("Content-Length", str(length))
-                self.end_headers()
-                with open(file_path, "rb") as f:
-                    f.seek(start)
-                    remaining = length
-                    while remaining > 0:
-                        chunk = f.read(min(65536, remaining))
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        remaining -= len(chunk)
-                return
-            except Exception:
-                pass
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        users = load_json(USERS_FILE, {})
 
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(file_size))
-        self.send_header("Accept-Ranges", "bytes")
-        if as_attachment:
-            self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
-        self.end_headers()
-        with open(file_path, "rb") as f:
-            shutil.copyfileobj(f, self.wfile)
+        if username in users and check_password_hash(users[username]["password_hash"], password):
+            session["user"] = username
+            session["role"] = users[username].get("role", "readonly")
+            return redirect(url_for("index"))
+        error = "Ungültiger Benutzername oder Passwort / Invalid credentials"
 
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
+    return render_template("login.html", error=error, lang=lang)
 
-        if path in ("/", "/index.html"):
-            self.serve_file_with_range(Path(__file__).parent / "index.html", "text/html; charset=utf-8")
-            return
 
-        if path == "/api/settings":
-            self.send_json(load_settings())
-            return
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
-        if path == "/api/status":
-            cfg = load_settings()
-            status_map = {}
-            now = time.time()
-            for cam in cfg.get("cameras", []):
-                cid = str(cam.get("id"))
-                with processes_lock:
-                    info = camera_processes.get(cid)
-                last_act = get_stream_last_activity(cid)
-                online = bool(
-                    info and info.get("proc") and info["proc"].poll() is None
-                    and last_act > 0 and (now - last_act) < 25
-                )
-                status_map[cid] = {
-                    "online": online,
-                    "mode": cam.get("mode", "live"),
-                    "restarts": info.get("restarts", 0) if info else 0
-                }
-            self.send_json(status_map)
-            return
 
-        if path == "/api/disk":
-            usage = shutil.disk_usage(RECORDINGS_DIR)
-            self.send_json({
-                "total_gb": round(usage.total / (1024 ** 3), 2),
-                "used_gb": round(usage.used / (1024 ** 3), 2),
-                "free_gb": round(usage.free / (1024 ** 3), 2),
-                "percent": round((usage.used / usage.total) * 100, 1) if usage.total else 0
+@app.route("/")
+@login_required
+def index():
+    return render_template(
+        "index.html",
+        username=session.get("user"),
+        role=session.get("role", "readonly")
+    )
+
+
+# ==============================================================================
+# API: BOOTSTRAP, KAMERAS & EINSTELLUNGEN
+# ==============================================================================
+
+@app.route("/api/bootstrap", methods=["GET"])
+@login_required
+def api_bootstrap():
+    role = session.get("role", "readonly")
+    settings = load_json(SETTINGS_FILE, {})
+    cameras = load_json(CAMERAS_FILE, [])
+
+    safe_cameras = []
+    for c in cameras:
+        with workers_lock:
+            w = camera_workers.get(c["id"])
+            online = w.connected if w else False
+            motion = w.motion_detected if w else False
+
+        if role == "admin":
+            cam_copy = dict(c)
+        else:
+            # Read-Only Benutzer erhalten keine Zugangsdaten oder RTSP-Passwörter
+            cam_copy = {
+                "id": c["id"],
+                "name": c.get("name", "Camera"),
+                "recording_mode": c.get("recording_mode", "live"),
+                "ptz_enabled": False
+            }
+        cam_copy["online"] = online
+        cam_copy["motion"] = motion
+        safe_cameras.append(cam_copy)
+
+    return jsonify({
+        "user": session.get("user"),
+        "role": role,
+        "settings": settings if role == "admin" else {"language": settings.get("language", "en")},
+        "cameras": safe_cameras,
+        "detected_subnet": get_local_subnet_prefix()
+    })
+
+
+@app.route("/api/cameras", methods=["GET", "POST"])
+@login_required
+def api_cameras():
+    if request.method == "GET":
+        if session.get("role") != "admin":
+            return jsonify({"error": "Forbidden"}), 403
+        return jsonify(load_json(CAMERAS_FILE, []))
+
+    # POST: Kamera anlegen oder aktualisieren (Nur Admin)
+    if session.get("role") != "admin":
+        return jsonify({"error": "Keine Berechtigung"}), 403
+
+    data = request.json or {}
+    cameras = load_json(CAMERAS_FILE, [])
+    cam_id = data.get("id") or str(uuid.uuid4())[:8]
+
+    ip = (data.get("ip") or "").strip()
+    user = (data.get("username") or "admin").strip()
+    password = data.get("password") or ""
+    brand = data.get("brand") or "tapo"
+    rtsp_url = (data.get("rtsp_url") or "").strip()
+
+    if not rtsp_url and ip:
+        if brand == "tapo":
+            rtsp_url = f"rtsp://{user}:{password}@{ip}:554/stream1"
+        elif brand == "hikvision":
+            rtsp_url = f"rtsp://{user}:{password}@{ip}:554/Streaming/Channels/101"
+        elif brand == "reolink":
+            rtsp_url = f"rtsp://{user}:{password}@{ip}:554/h264Preview_01_main"
+        else:
+            rtsp_url = f"rtsp://{user}:{password}@{ip}:554/stream1"
+
+    rec_mode = data.get("recording_mode", "live")
+    if rec_mode not in ("live", "motion", "24/7"):
+        rec_mode = "live"
+
+    existing = next((c for c in cameras if c["id"] == cam_id), None)
+    cam_obj = {
+        "id": cam_id,
+        "name": (data.get("name") or f"Kamera {ip}").strip(),
+        "brand": brand,
+        "ip": ip,
+        "onvif_port": int(data.get("onvif_port") or (2020 if brand == "tapo" else 80)),
+        "username": user,
+        "password": password,
+        "rtsp_url": rtsp_url,
+        "recording_mode": rec_mode,
+        "ptz_enabled": bool(data.get("ptz_enabled", True)),
+        "motion_sensitivity": int(data.get("motion_sensitivity", existing.get("motion_sensitivity", 50) if existing else 50)),
+        "privacy_zones": data.get("privacy_zones", existing.get("privacy_zones", []) if existing else []),
+        "motion_zones": data.get("motion_zones", existing.get("motion_zones", []) if existing else [])
+    }
+
+    if existing:
+        idx = cameras.index(existing)
+        cameras[idx] = cam_obj
+    else:
+        cameras.append(cam_obj)
+
+    save_json(CAMERAS_FILE, cameras)
+    sync_camera_workers()
+    return jsonify({"status": "ok", "camera": cam_obj})
+
+
+@app.route("/api/cameras/<cam_id>", methods=["DELETE"])
+@admin_required
+def api_delete_camera(cam_id):
+    cameras = load_json(CAMERAS_FILE, [])
+    cameras = [c for c in cameras if c["id"] != cam_id]
+    save_json(CAMERAS_FILE, cameras)
+    sync_camera_workers()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/cameras/<cam_id>/mode", methods=["POST"])
+@admin_required
+def api_camera_mode(cam_id):
+    data = request.json or {}
+    mode = data.get("recording_mode", "live")
+    if mode not in ("live", "motion", "24/7"):
+        return jsonify({"error": "Ungültiger Modus"}), 400
+
+    cameras = load_json(CAMERAS_FILE, [])
+    for c in cameras:
+        if c["id"] == cam_id:
+            c["recording_mode"] = mode
+            break
+    save_json(CAMERAS_FILE, cameras)
+    sync_camera_workers()
+    return jsonify({"status": "ok", "recording_mode": mode})
+
+
+@app.route("/api/cameras/<cam_id>/zones", methods=["POST"])
+@admin_required
+def api_camera_zones(cam_id):
+    data = request.json or {}
+    cameras = load_json(CAMERAS_FILE, [])
+    for c in cameras:
+        if c["id"] == cam_id:
+            if "privacy_zones" in data:
+                c["privacy_zones"] = data["privacy_zones"]
+            if "motion_zones" in data:
+                c["motion_zones"] = data["motion_zones"]
+            if "motion_sensitivity" in data:
+                c["motion_sensitivity"] = int(data["motion_sensitivity"])
+            break
+    save_json(CAMERAS_FILE, cameras)
+    sync_camera_workers()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/scan", methods=["POST"])
+@admin_required
+def api_scan_network():
+    data = request.json or {}
+    subnet = data.get("subnet", "").strip()
+    found = hybrid_network_scan(subnet_prefix=subnet)
+    return jsonify({"found": found, "subnet": subnet or get_local_subnet_prefix()})
+
+
+@app.route("/api/ptz/<cam_id>", methods=["POST"])
+@admin_required
+def api_ptz(cam_id):
+    data = request.json or {}
+    direction = data.get("direction", "stop")
+    cameras = load_json(CAMERAS_FILE, [])
+    cam = next((c for c in cameras if c["id"] == cam_id), None)
+    if not cam:
+        return jsonify({"error": "Kamera nicht gefunden"}), 404
+    ok, msg = execute_onvif_ptz(cam, direction)
+    return jsonify({"status": "ok" if ok else "error", "message": msg})
+
+
+@app.route("/api/settings", methods=["POST"])
+@admin_required
+def api_save_settings():
+    data = request.json or {}
+    settings = load_json(SETTINGS_FILE, {})
+
+    if "language" in data and data["language"] in ("en", "de", "fr", "es"):
+        settings["language"] = data["language"]
+
+    if "recording_interval" in data:
+        val = int(data["recording_interval"])
+        # Erlaubt 15-Minuten-Schritte von 15 bis 120 Minuten
+        if val in (15, 30, 45, 60, 75, 90, 105, 120):
+            settings["recording_interval"] = val
+        else:
+            settings["recording_interval"] = max(15, min(120, val))
+
+    if "retention_days" in data:
+        settings["retention_days"] = max(1, min(365, int(data["retention_days"])))
+    if "motion_post_buffer" in data:
+        settings["motion_post_buffer"] = max(5, min(300, int(data["motion_post_buffer"])))
+    if "ntfy_url" in data:
+        settings["ntfy_url"] = data["ntfy_url"].strip()
+    if "ha_webhook_url" in data:
+        settings["ha_webhook_url"] = data["ha_webhook_url"].strip()
+    if "alert_cooldown" in data:
+        settings["alert_cooldown"] = max(10, min(3600, int(data["alert_cooldown"])))
+
+    save_json(SETTINGS_FILE, settings)
+    return jsonify({"status": "ok", "settings": settings})
+
+
+# ==============================================================================
+# API: BENUTZERVERWALTUNG (ADMIN & READONLY)
+# ==============================================================================
+
+@app.route("/api/users", methods=["GET", "POST"])
+@admin_required
+def api_users():
+    users = load_json(USERS_FILE, {})
+    if request.method == "GET":
+        result = [
+            {"username": u, "role": info.get("role", "readonly"), "created_at": info.get("created_at", "")}
+            for u, info in users.items()
+        ]
+        return jsonify(result)
+
+    data = request.json or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    role = data.get("role", "readonly")
+
+    if not username or not password:
+        return jsonify({"error": "Benutzername und Passwort erforderlich"}), 400
+    if role not in ("admin", "readonly"):
+        role = "readonly"
+
+    users[username] = {
+        "password_hash": generate_password_hash(password),
+        "role": role,
+        "created_at": datetime.datetime.now().isoformat()
+    }
+    save_json(USERS_FILE, users)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/users/<username>", methods=["DELETE"])
+@admin_required
+def api_delete_user(username):
+    users = load_json(USERS_FILE, {})
+    if username not in users:
+        return jsonify({"error": "Benutzer nicht gefunden"}), 404
+
+    # Verhindern, dass der letzte Admin gelöscht wird
+    admin_count = sum(1 for u, info in users.items() if info.get("role") == "admin")
+    if users[username].get("role") == "admin" and admin_count <= 1:
+        return jsonify({"error": "Der letzte Administrator kann nicht gelöscht werden"}), 400
+
+    del users[username]
+    save_json(USERS_FILE, users)
+    return jsonify({"status": "ok"})
+
+
+# ==============================================================================
+# API: LIVE STREAM & INSTANT SNAPSHOT (SINGLE RTSP STREAM)
+# ==============================================================================
+
+def generate_mjpeg(cam_id):
+    while True:
+        with workers_lock:
+            worker = camera_workers.get(cam_id)
+        if worker is None:
+            break
+        jpg = worker.get_jpeg()
+        if jpg:
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            )
+        time.sleep(0.08)
+
+
+@app.route("/api/stream/<cam_id>")
+@login_required
+def api_stream(cam_id):
+    return Response(
+        generate_mjpeg(cam_id),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.route("/api/snapshot/<cam_id>")
+@login_required
+def api_snapshot(cam_id):
+    with workers_lock:
+        worker = camera_workers.get(cam_id)
+    if not worker:
+        abort(404)
+    jpg = worker.get_jpeg()
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        jpg,
+        mimetype="image/jpeg",
+        headers={"Content-Disposition": f'attachment; filename="snapshot_{cam_id}_{ts}.jpg"'}
+    )
+
+
+# ==============================================================================
+# API: ARCHIV & ZEITRAUM-EXPORT (STRIKT NUR FÜR ADMINISTRATOREN!)
+# ==============================================================================
+
+@app.route("/api/archive", methods=["GET"])
+@admin_required
+def api_archive_list():
+    ensure_daily_folders()
+    date_filter = request.args.get("date", "").strip()
+    time_from = request.args.get("from", "00:00").strip() or "00:00"
+    time_to = request.args.get("to", "23:59").strip() or "23:59"
+    cam_filter = request.args.get("camera_id", "").strip()
+
+    available_dates = sorted(
+        [d for d in os.listdir(RECORDINGS_DIR) if os.path.isdir(os.path.join(RECORDINGS_DIR, d)) and re.match(r"^\d{4}-\d{2}-\d{2}$", d)],
+        reverse=True
+    )
+
+    if not date_filter and available_dates:
+        date_filter = available_dates[0]
+
+    files_list = []
+    target_dir = os.path.join(RECORDINGS_DIR, date_filter) if date_filter else None
+
+    if target_dir and os.path.isdir(target_dir):
+        for fname in sorted(os.listdir(target_dir), reverse=True):
+            if not fname.endswith(".mp4"):
+                continue
+            fpath = os.path.join(target_dir, fname)
+            parts = fname[:-4].split("__")
+            cid = parts[0] if len(parts) > 0 else "unknown"
+            cname = parts[1] if len(parts) > 1 else cid
+            t_raw = parts[2] if len(parts) > 2 else "00-00-00"
+            mode_tag = parts[3] if len(parts) > 3 else "REC"
+
+            hh_mm = t_raw[:5].replace("-", ":")
+            if cam_filter and cid != cam_filter:
+                continue
+            if not (time_from <= hh_mm <= time_to):
+                continue
+
+            size_mb = round(os.path.getsize(fpath) / (1024 * 1024), 2)
+            files_list.append({
+                "date": date_filter,
+                "filename": fname,
+                "camera_id": cid,
+                "camera_name": cname.replace("_", " "),
+                "time": t_raw.replace("-", ":"),
+                "mode": mode_tag,
+                "size_mb": size_mb
             })
-            return
 
-        if path in ("/api/events", "/api/recordings"):
-            items = list_all_recordings()
-            dates = sorted({i["date"] for i in items}, reverse=True)
-            self.send_json({"events": items, "dates": dates})
-            return
-
-        if path == "/api/onvif_scan":
-            host_header = self.headers.get("Host", "")
-            self.send_json({"devices": discover_onvif_devices(hint_host=host_header)})
-            return
-
-        if path == "/api/snapshot":
-            cam_id = (query.get("cam_id") or [""])[0]
-            cfg = load_settings()
-            cam = next((c for c in cfg.get("cameras", []) if str(c.get("id")) == str(cam_id)), None)
-            if not cam:
-                self.send_error(404, "Camera not found")
-                return
-            rtsp_url = build_rtsp_url(cam)
-            try:
-                res = subprocess.run(
-                    ["ffmpeg", "-rtsp_transport", "tcp", "-i", rtsp_url,
-                     "-frames:v", "1", "-f", "image2", "-vcodec", "mjpeg", "pipe:1"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8
-                )
-                if res.stdout:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/jpeg")
-                    self.send_header("Content-Length", str(len(res.stdout)))
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    self.wfile.write(res.stdout)
-                    return
-            except Exception:
-                pass
-            self.send_error(500, "Snapshot failed")
-            return
-
-        if path == "/api/export":
-            rel = (query.get("file") or [""])[0]
-            date_filter = (query.get("date") or [""])[0]
-            if rel:
-                target = (RECORDINGS_DIR / rel).resolve()
-                if not str(target).startswith(str(RECORDINGS_DIR.resolve())):
-                    self.send_error(403, "Forbidden")
-                    return
-                self.serve_file_with_range(target, "video/mp4", as_attachment=True)
-                return
-            if date_filter:
-                tmp_zip = Path(tempfile.mktemp(suffix=f"_{date_filter}.zip"))
-                try:
-                    with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_STORED) as zf:
-                        for mp4 in RECORDINGS_DIR.rglob("*.mp4"):
-                            if date_filter in mp4.relative_to(RECORDINGS_DIR).as_posix():
-                                zf.write(mp4, mp4.relative_to(RECORDINGS_DIR).as_posix())
-                    self.serve_file_with_range(tmp_zip, "application/zip", as_attachment=True)
-                finally:
-                    try:
-                        tmp_zip.unlink()
-                    except Exception:
-                        pass
-                return
-            self.send_error(400, "Missing parameter")
-            return
-
-        if path.startswith("/stream/"):
-            rel = path[len("/stream/"):]
-            target = (STREAMS_DIR / rel).resolve()
-            if not str(target).startswith(str(STREAMS_DIR.resolve())) or not target.exists():
-                self.send_error(404, "Stream segment not ready")
-                return
-            ctype = "application/vnd.apple.mpegurl" if target.suffix == ".m3u8" else "video/MP2T"
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            data = target.read_bytes()
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
-
-        if path.startswith("/recordings/"):
-            rel = urllib.parse.unquote(path[len("/recordings/"):])
-            target = (RECORDINGS_DIR / rel).resolve()
-            if not str(target).startswith(str(RECORDINGS_DIR.resolve())):
-                self.send_error(403, "Forbidden")
-                return
-            self.serve_file_with_range(target, "video/mp4")
-            return
-
-        self.send_error(404, "Not found")
-
-    def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length) if length > 0 else b"{}"
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except Exception:
-            payload = {}
-
-        if path == "/api/settings":
-            save_settings(payload)
-            ensure_all_daily_folders()
-            sync_all_cameras()
-            self.send_json(load_settings())
-            return
-
-        if path == "/api/language":
-            cfg = load_settings()
-            cfg["language"] = payload.get("language", "de")
-            save_settings(cfg)
-            self.send_json({"ok": True, "language": cfg["language"]})
-            return
-
-        if path == "/api/ptz":
-            cam_id = str(payload.get("cam_id", ""))
-            action = payload.get("action", "move")
-            direction = payload.get("direction", "stop")
-            cfg = load_settings()
-            cam = next((c for c in cfg.get("cameras", []) if str(c.get("id")) == cam_id), None)
-            if not cam:
-                self.send_json({"ok": False, "error": "Camera not found"}, status=404)
-                return
-            ok = send_onvif_ptz(cam, action=action, direction=direction)
-            self.send_json({"ok": ok})
-            return
-
-        self.send_error(404, "Not found")
-
-    def do_DELETE(self):
-        parsed = urllib.parse.urlparse(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
-        if parsed.path in ("/api/events", "/api/recordings"):
-            rel = (query.get("file") or [""])[0]
-            target = (RECORDINGS_DIR / rel).resolve()
-            if str(target).startswith(str(RECORDINGS_DIR.resolve())) and target.exists():
-                try:
-                    target.unlink()
-                    self.send_json({"ok": True})
-                    return
-                except Exception as e:
-                    self.send_json({"ok": False, "error": str(e)}, status=500)
-                    return
-            self.send_json({"ok": False, "error": "File not found"}, status=404)
-            return
-        self.send_error(404, "Not found")
+    return jsonify({
+        "available_dates": available_dates,
+        "selected_date": date_filter,
+        "recordings": files_list
+    })
 
 
-def shutdown_handler(signum, frame):
-    print("\n[SYSTEM] Beende OpenCam Lite und stoppe alle FFmpeg-Prozesse...")
-    stop_event.set()
-    with processes_lock:
-        cids = list(camera_processes.keys())
-    for cid in cids:
-        stop_ffmpeg_for_cam(cid)
-    sys.exit(0)
+@app.route("/api/archive/video/<date_str>/<filename>")
+@admin_required
+def api_archive_video(date_str, filename):
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str) or "/" in filename or "\\" in filename:
+        abort(400)
+    fpath = os.path.join(RECORDINGS_DIR, date_str, filename)
+    if not os.path.isfile(fpath):
+        abort(404)
+    dl = request.args.get("download") == "1"
+    return send_file(fpath, mimetype="video/mp4", as_attachment=dl, download_name=filename)
+
+
+@app.route("/api/archive/video/<date_str>/<filename>", methods=["DELETE"])
+@admin_required
+def api_archive_delete(date_str, filename):
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str) or "/" in filename or "\\" in filename:
+        abort(400)
+    fpath = os.path.join(RECORDINGS_DIR, date_str, filename)
+    if os.path.isfile(fpath):
+        os.remove(fpath)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/archive/export", methods=["GET"])
+@admin_required
+def api_archive_export_zip():
+    date_filter = request.args.get("date", "").strip()
+    time_from = request.args.get("from", "00:00").strip() or "00:00"
+    time_to = request.args.get("to", "23:59").strip() or "23:59"
+    cam_filter = request.args.get("camera_id", "").strip()
+
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_filter):
+        return jsonify({"error": "Ungültiges Datum"}), 400
+
+    target_dir = os.path.join(RECORDINGS_DIR, date_filter)
+    if not os.path.isdir(target_dir):
+        return jsonify({"error": "Ordner nicht gefunden"}), 404
+
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
+        for fname in sorted(os.listdir(target_dir)):
+            if not fname.endswith(".mp4"):
+                continue
+            parts = fname[:-4].split("__")
+            cid = parts[0] if len(parts) > 0 else ""
+            t_raw = parts[2] if len(parts) > 2 else "00-00-00"
+            hh_mm = t_raw[:5].replace("-", ":")
+
+            if cam_filter and cid != cam_filter:
+                continue
+            if not (time_from <= hh_mm <= time_to):
+                continue
+
+            fpath = os.path.join(target_dir, fname)
+            zf.write(fpath, arcname=f"{date_filter}/{fname}")
+
+    mem_zip.seek(0)
+    zip_name = f"OpenCam_Archive_{date_filter}_{time_from.replace(':','')}-{time_to.replace(':','')}.zip"
+    return send_file(mem_zip, mimetype="application/zip", as_attachment=True, download_name=zip_name)
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-
-    ensure_all_daily_folders()
-    sync_all_cameras()
-
-    wd_thread = threading.Thread(target=watchdog_and_maintenance_loop, daemon=True)
-    wd_thread.start()
-
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), RequestHandler)
-    print(f"[SYSTEM] OpenCam Lite läuft auf http://0.0.0.0:{PORT}")
-    server.serve_forever()
+    app.run(host="0.0.0.0", port=8080, threaded=True)
