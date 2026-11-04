@@ -1,8 +1,7 @@
 name: opencam-lite
 services:
   opencam-lite:
-    build: .
-    image: opencam-lite:latest
+    image: ghcr.io/chrizz82/opencam-lite:latest
     container_name: opencam-lite
     restart: unless-stopped
     network_mode: host
@@ -11,3 +10,6 @@ services:
     volumes:
       - ./config:/config
       - ./recordings:/recordings
+    labels:
+      net.bigbear.casaos.name: "OpenCam Lite"
+      net.bigbear.casaOS.icon: "https://raw.githubusercontent.com/chrizzz82/opencam-lite/main/icon.png"
