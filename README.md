@@ -1,54 +1,34 @@
-# 🛡️ OpenCam Lite
+# 📹 OpenCam Lite
 
-**OpenCam Lite** is a lightweight, self-hosted, local-first NVR (Network Video Recorder) built for ZimaOS, CasaOS, and Docker environments. Designed as an easy-to-use alternative to bloated video management systems, it focuses on low resource usage, instant setup, and full local control.
-
-![Status](https://img.shields.io/badge/version-v0.1.0-brightgreen) ![Docker](https://img.shields.io/badge/docker-ready-blue) ![License](https://img.shields.io/badge/license-MIT-yellow)
+**OpenCam Lite** is a lightweight, local-first NVR (Network Video Recorder) built for Docker, CasaOS, and ZimaOS. It is optimized for Tapo and ONVIF-compatible cameras, utilizing a single RTSP stream for both low-latency live viewing and continuous 24/7 recording.
 
 ---
 
-## ✨ Key Features
+## 🚀 Key Features
 
-* **Single RTSP Connection Architecture:** Uses only one RTSP stream per camera simultaneously for live viewing and 24/7 recording—preventing camera-side stream lockouts (especially on TP-Link Tapo cameras).
-* **ONVIF Auto-Discovery & Manual Setup:** Scan your local network for ONVIF/RTSP cameras with a single click or configure cameras manually using built-in brand presets.
-* **Customizable Live Grid:** Freely resize camera tiles via drag-and-drop (persisted in `localStorage`) with smooth digital zoom and pan.
-* **Visual Zone Editor:** Draw Privacy Zones (permanent blackout in stream and recordings) and Motion Zones directly over the live video feed.
-* **Flexible 24/7 Recording:** Choose recording file lengths in 15-minute increments (15 to 120 minutes) with automatic retention cleanup and ZIP time-range export.
-* **Instant Snapshots:** Zero-delay snapshots from the active stream without opening additional RTSP connections.
-* **Multi-Language UI:** English (default), German, French, and Spanish with server-side persistence.
-* **ONVIF PTZ & Alerts:** Built-in pan/tilt controls and push notifications via `ntfy.sh` or Home Assistant webhooks.
+* **Single-RTSP Architecture:** Pulls one stream per camera and multiplexes it into an in-memory HLS live stream and daily MP4 recording files simultaneously.
+* **Daily Recording Folders (`YYYY-MM-DD`):** Automatically structures recordings into daily subfolders (`/recordings/<Camera>/YYYY-MM-DD/`) with pre-emptive directory creation to prevent midnight crashes.
+* **Watchdog & Auto-Reconnect:** Continuously monitors stream health, detects frozen connections or nightly camera reboots, and automatically reconnects after a short pause.
+* **Advanced Archive Search:** Integrated filters for daily folders, cameras, and precise **Time Ranges (From / To)**, plus single-file and full-day ZIP exports.
+* **Signed Tapo PTZ Support:** Built-in pan and tilt controls with ONVIF WS-Security Digest Authentication directly in the card footer.
+* **Zone Editor:** Draw privacy blackout masks and green motion detection zones directly over the live video canvas.
+* **Multilingual UI (i18n):** Fully available in German, English, French, and Spanish.
+* **Push Notifications:** Optional alerts via `ntfy.sh` or Home Assistant webhooks.
 
 ---
 
-## 🚀 Quick Start (Docker Compose)
+## 🛠️ Quick Start (Docker Compose)
 
-1. Clone this repository or copy the files into `/DATA/AppData/opencam-lite`.
-2. Run the container:
-
-```bash
-docker compose up -d --build
-
-3. Open http://<your-server-ip>:7777 in your browser.
-
-        Default Login: admin / admin
-
-📹 Supported Camera Presets
-
-    TP-Link Tapo
-
-    Reolink
-
-    Hikvision
-
-    Dahua / Amcrest
-
-    Foscam
-
-    Uniview (UNV)
-
-    Axis
-
-    Generic ONVIF / Custom RTSP Path
-
-🔒 Privacy First
-
-OpenCam Lite runs 100% locally. No cloud accounts, no subscriptions, and no external telemetry.
+```yaml
+name: opencam-lite
+services:
+  opencam-lite:
+    image: ghcr.io/chrizz82/opencam-lite:latest
+    container_name: opencam-lite
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=Europe/Berlin
+    volumes:
+      - ./config:/config
+      - ./recordings:/recordings
