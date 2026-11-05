@@ -22,7 +22,9 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v0.2.1"
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "chrizzz82/opencam-lite")
+PORT = int(os.environ.get("PORT", 7777))
 
 # RTSP über TCP erzwingen und Timeout setzen (verhindert Hänger bei Tapo/Hikvision)
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
@@ -45,9 +47,69 @@ config_lock = threading.Lock()
 workers_lock = threading.Lock()
 camera_workers = {}
 
+update_cache = {
+    "last_checked": 0,
+    "latest_version": APP_VERSION,
+    "update_available": False,
+    "repo_url": f"https://github.com/{GITHUB_REPO}"
+}
+
 
 # ==============================================================================
-# KONFIGURATION & PERSISTENZ
+# UPDATE-CHECK GEGEN GITHUB
+# ==============================================================================
+
+def parse_version_tuple(v_str):
+    cleaned = re.sub(r"[^0-9.]", "", str(v_str or ""))
+    parts = [int(p) for p in cleaned.split(".") if p.isdigit()]
+    return tuple(parts) if parts else (0, 0, 0)
+
+
+def check_for_updates(force=False):
+    now = time.time()
+    if not force and (now - update_cache["last_checked"] < 900):
+        return update_cache
+
+    settings = load_json(SETTINGS_FILE, {})
+    repo = (settings.get("github_repo") or GITHUB_REPO).strip()
+    remote_version = None
+
+    try:
+        raw_url = f"https://raw.githubusercontent.com/{repo}/main/server.py"
+        resp = requests.get(raw_url, timeout=3.5, headers={"Cache-Control": "no-cache"})
+        if resp.status_code == 200:
+            match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', resp.text)
+            if match:
+                remote_version = match.group(1).strip()
+    except Exception:
+        pass
+
+    if not remote_version:
+        try:
+            api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+            resp = requests.get(api_url, timeout=3.5)
+            if resp.status_code == 200:
+                tag = resp.json().get("tag_name")
+                if tag:
+                    remote_version = tag.strip()
+        except Exception:
+            pass
+
+    if remote_version:
+        is_newer = parse_version_tuple(remote_version) > parse_version_tuple(APP_VERSION)
+        update_cache["latest_version"] = remote_version
+        update_cache["update_available"] = is_newer
+    else:
+        update_cache["latest_version"] = APP_VERSION
+        update_cache["update_available"] = False
+
+    update_cache["last_checked"] = now
+    update_cache["repo_url"] = f"https://github.com/{repo}"
+    return update_cache
+
+
+# ==============================================================================
+# KONFIGURATION & PERSISTENZ (ÜBERSCHREIBT NIEMALS VORHANDENE DATEIEN)
 # ==============================================================================
 
 def load_json(path, default):
@@ -59,7 +121,8 @@ def load_json(path, default):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"[Config] Warnung beim Lesen von {path}: {e}")
             return default
 
 
@@ -72,6 +135,7 @@ def save_json(path, data):
 
 
 def init_configs():
+    # Nur anlegen, wenn die Datei noch überhaupt nicht existiert
     if not os.path.exists(USERS_FILE):
         default_users = {
             "admin": {
@@ -86,26 +150,32 @@ def init_configs():
         save_json(CAMERAS_FILE, [])
 
     default_settings = {
-        "language": "en",
-        "recording_interval": 15,  # 15 bis 120 Minuten
+        "language": "de",
+        "recording_interval": 15,
         "retention_days": 7,
-        "motion_post_buffer": 15,  # Sekunden Nachlauf bei Bewegung
+        "motion_post_buffer": 15,
         "ntfy_url": "",
         "ha_webhook_url": "",
-        "alert_cooldown": 60
+        "alert_cooldown": 60,
+        "github_repo": GITHUB_REPO
     }
-    current_settings = load_json(SETTINGS_FILE, default_settings)
-    for k, v in default_settings.items():
-        if k not in current_settings:
-            current_settings[k] = v
-    save_json(SETTINGS_FILE, current_settings)
+    if not os.path.exists(SETTINGS_FILE):
+        save_json(SETTINGS_FILE, default_settings)
+    else:
+        current_settings = load_json(SETTINGS_FILE, default_settings)
+        changed = False
+        for k, v in default_settings.items():
+            if k not in current_settings:
+                current_settings[k] = v
+                changed = True
+        if changed:
+            save_json(SETTINGS_FILE, current_settings)
 
 
 init_configs()
 
 
 def ensure_daily_folders():
-    """Erstellt die YYYY-MM-DD Ordner für heute und morgen vorab (verhindert Mitternachts-Fehler)."""
     now = datetime.datetime.now()
     for delta in (0, 1):
         day_str = (now + datetime.timedelta(days=delta)).strftime("%Y-%m-%d")
@@ -114,7 +184,6 @@ def ensure_daily_folders():
 
 
 def cleanup_old_recordings():
-    """Löscht Tagesordner, die älter als retention_days sind."""
     settings = load_json(SETTINGS_FILE, {})
     retention_days = int(settings.get("retention_days", 7))
     if retention_days <= 0:
@@ -184,7 +253,6 @@ class CameraStreamWorker:
         self.last_motion_time = 0
         self.last_alert_time = 0
 
-        # VideoWriter Status
         self.writer = None
         self.current_rec_start = 0
         self.current_rec_date = ""
@@ -335,7 +403,6 @@ class CameraStreamWorker:
                 time.sleep(2)
                 continue
 
-            # Watchdog: Prüft auf Verbindungsabbruch oder > 25 Sekunden ohne Frame
             if cap is None or not cap.isOpened() or (time.time() - self.last_frame_time > 25.0):
                 self.connected = False
                 self._close_writer()
@@ -377,10 +444,8 @@ class CameraStreamWorker:
                 sensitivity = self.config.get("motion_sensitivity", 50)
                 cam_name = self.config.get("name", "Camera")
 
-            # 1. Privacy Zones permanent schwärzen (vor Live-Stream UND vor Aufnahme)
             self._apply_privacy_zones(frame, privacy_zones)
 
-            # 2. Bewegungserkennung berechnen
             small = cv2.resize(frame, (320, 180))
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (9, 9), 0)
@@ -401,13 +466,11 @@ class CameraStreamWorker:
                         daemon=True
                     ).start()
 
-            # 3. Aufnahme verarbeiten (ohne künstliches Text-Overlay, da Kamera-OSD vorhanden)
             try:
                 self._handle_recording(frame, fps_estimate)
             except Exception as e:
                 print(f"[Recording] Fehler bei {cam_name}: {e}")
 
-            # 4. JPEG für Live-Stream & Sofort-Snapshots aktualisieren
             ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
                 with self.lock:
@@ -444,9 +507,10 @@ def background_housekeeping():
         try:
             ensure_daily_folders()
             cleanup_old_recordings()
+            check_for_updates(force=False)
         except Exception as e:
             print(f"[Housekeeping] Fehler: {e}")
-        time.sleep(1800)
+        time.sleep(900)
 
 
 sync_camera_workers()
@@ -454,7 +518,7 @@ threading.Thread(target=background_housekeeping, daemon=True).start()
 
 
 # ==============================================================================
-# HYBRID ONVIF SCANNER (MULTICAST + PARALLELER TCP-SCAN AB .2 BIS .254)
+# HYBRID ONVIF SCANNER (AB .2 BIS .254)
 # ==============================================================================
 
 def get_local_subnet_prefix():
@@ -472,7 +536,6 @@ def get_local_subnet_prefix():
 
 
 def is_router_ip(ip_str):
-    """Filtert strikt .1 (Router/Gateway) und ungültige IPs heraus."""
     parts = ip_str.strip().split(".")
     if len(parts) != 4:
         return True
@@ -531,7 +594,6 @@ def ws_discovery_scan(timeout=2.0):
 
 
 def probe_host_ports(ip):
-    """Prüft typische Kamera-Ports (RTSP 554, Tapo ONVIF 2020, Hikvision 8000, ONVIF 8899/8554)."""
     if is_router_ip(ip):
         return None
 
@@ -588,7 +650,6 @@ def hybrid_network_scan(subnet_prefix=None):
     subnet_prefix = subnet_prefix.strip()
 
     ws_ips = ws_discovery_scan(timeout=1.5)
-    # Strikt ab .2 bis .254 scannen (Router auf .1 wird ausgeschlossen!)
     target_ips = [f"{subnet_prefix}.{i}" for i in range(2, 255)]
     for wip in ws_ips:
         if not is_router_ip(wip) and wip not in target_ips:
@@ -607,7 +668,7 @@ def hybrid_network_scan(subnet_prefix=None):
 
 
 # ==============================================================================
-# SIGNED TAPO & ONVIF PTZ (WS-SECURITY DIGEST AUTHENTICATION)
+# SIGNED TAPO & ONVIF PTZ
 # ==============================================================================
 
 def build_wsse_header(username, password):
@@ -703,7 +764,7 @@ def execute_onvif_ptz(cam, direction, speed=0.5):
 
 
 # ==============================================================================
-# AUTHENTIFIZIERUNG & ROLLEN-DEKORATOREN (ADMIN vs. READONLY)
+# AUTHENTIFIZIERUNG & ROLLEN
 # ==============================================================================
 
 def login_required(f):
@@ -728,15 +789,11 @@ def admin_required(f):
     return decorated
 
 
-# ==============================================================================
-# ROUTEN: LOGIN & HAUPTSEITE
-# ==============================================================================
-
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
     settings = load_json(SETTINGS_FILE, {})
-    lang = settings.get("language", "en")
+    lang = settings.get("language", "de")
 
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
@@ -770,7 +827,7 @@ def index():
 
 
 # ==============================================================================
-# API: BOOTSTRAP, KAMERAS & EINSTELLUNGEN
+# API: BOOTSTRAP, UPDATE-CHECK, KAMERAS & EINSTELLUNGEN
 # ==============================================================================
 
 @app.route("/api/bootstrap", methods=["GET"])
@@ -779,6 +836,7 @@ def api_bootstrap():
     role = session.get("role", "readonly")
     settings = load_json(SETTINGS_FILE, {})
     cameras = load_json(CAMERAS_FILE, [])
+    upd = check_for_updates(force=False) if role == "admin" else {}
 
     safe_cameras = []
     for c in cameras:
@@ -802,11 +860,24 @@ def api_bootstrap():
 
     return jsonify({
         "version": APP_VERSION,
+        "update_info": upd,
         "user": session.get("user"),
         "role": role,
-        "settings": settings if role == "admin" else {"language": settings.get("language", "en")},
+        "settings": settings if role == "admin" else {"language": settings.get("language", "de")},
         "cameras": safe_cameras,
         "detected_subnet": get_local_subnet_prefix()
+    })
+
+
+@app.route("/api/update_check", methods=["GET"])
+@admin_required
+def api_update_check():
+    upd = check_for_updates(force=True)
+    return jsonify({
+        "current_version": APP_VERSION,
+        "latest_version": upd.get("latest_version", APP_VERSION),
+        "update_available": upd.get("update_available", False),
+        "repo_url": upd.get("repo_url", f"https://github.com/{GITHUB_REPO}")
     })
 
 
@@ -966,10 +1037,11 @@ def api_save_settings():
         settings["ntfy_url"] = data["ntfy_url"].strip()
     if "ha_webhook_url" in data:
         settings["ha_webhook_url"] = data["ha_webhook_url"].strip()
-    if "alert_cooldown" in data:
-        settings["alert_cooldown"] = max(10, min(3600, int(data["alert_cooldown"])))
+    if "github_repo" in data and data["github_repo"].strip():
+        settings["github_repo"] = data["github_repo"].strip()
 
     save_json(SETTINGS_FILE, settings)
+    check_for_updates(force=True)
     return jsonify({"status": "ok", "settings": settings})
 
 
@@ -1024,7 +1096,7 @@ def api_delete_user(username):
 
 
 # ==============================================================================
-# API: LIVE STREAM & INSTANT SNAPSHOT (SINGLE RTSP STREAM)
+# API: LIVE STREAM & SNAPSHOT
 # ==============================================================================
 
 def generate_mjpeg(cam_id):
@@ -1068,7 +1140,7 @@ def api_snapshot(cam_id):
 
 
 # ==============================================================================
-# API: ARCHIV & ZEITRAUM-EXPORT (STRIKT NUR FÜR ADMINISTRATOREN!)
+# API: ARCHIV & ZEITRAUM-EXPORT (NUR ADMIN)
 # ==============================================================================
 
 @app.route("/api/archive", methods=["GET"])
@@ -1188,4 +1260,4 @@ def api_archive_export_zip():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, threaded=True)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
