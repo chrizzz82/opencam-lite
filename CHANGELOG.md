@@ -15,3 +15,17 @@ All notable changes to OpenCam Lite will be documented in this file.
 ### Fixed
 - Fixed HLS stream freezes when enabling privacy or motion zone masks by enforcing stable `libx264` transcoding with `yuv420p` pixel formatting.
 - Relocated PTZ controls from an intrusive video overlay to the bottom card footer.
+
+
+
+# Changelog
+
+## [v0.2.1] - 2026-11-05
+### Added
+* **Automatic Update Checker:** Background check comparing the local version against the GitHub repository, displaying a direct notification in the header when updates are available.
+* **Integrated Update Modal:** Clicking the update badge opens a popup containing the exact ZimaOS terminal commands.
+* **Port Migration to 7777:** Standardized port configuration for clean homelab integration.
+
+### Changed & Optimized
+* **Persistent Configuration:** Hardcoded Docker volume mount points for `/config` and `/recordings` ensure all settings and recordings survive container updates.
+* **UI Refinement:** Cleaned up header badge styling and version display alongside the project title.
