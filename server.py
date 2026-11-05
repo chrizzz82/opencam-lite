@@ -22,6 +22,8 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
+APP_VERSION = "v1.1.0"
+
 # RTSP über TCP erzwingen und Timeout setzen (verhindert Hänger bei Tapo/Hikvision)
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
 
@@ -196,7 +198,6 @@ class CameraStreamWorker:
             rtsp_changed = self.config.get("rtsp_url") != new_config.get("rtsp_url")
             self.config = new_config
             if rtsp_changed:
-                # Erzwingt Reconnect durch Zurücksetzen des Watchdog-Timers
                 self.last_frame_time = 0
 
     def stop(self):
@@ -258,7 +259,6 @@ class CameraStreamWorker:
 
         changed_pixels = cv2.countNonZero(thresh)
         total_pixels = float(h * w)
-        # Sensitivität 1 (unempfindlich) bis 100 (sehr empfindlich)
         sens = max(1, min(100, int(sensitivity or 50)))
         required_ratio = 0.05 * ((101 - sens) / 100.0) * 0.5 + 0.0005
         return (changed_pixels / total_pixels) >= required_ratio
@@ -294,7 +294,6 @@ class CameraStreamWorker:
             self._close_writer()
             return
 
-        # Neue Datei starten, wenn kein Writer offen, Tageswechsel (Mitternacht) oder Intervall (15-120 Min) erreicht
         if (
             self.writer is None
             or self.current_rec_date != today_str
@@ -360,7 +359,6 @@ class CameraStreamWorker:
 
             ret, frame = cap.read()
             if not ret or frame is None:
-                # Wenn länger als 25 Sekunden kein Frame kam, schlägt der Watchdog oben zu
                 time.sleep(0.1)
                 continue
 
@@ -403,20 +401,13 @@ class CameraStreamWorker:
                         daemon=True
                     ).start()
 
-            # 3. Zeitstempel in Frame einbrennen
-            ts_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(frame, f"{cam_name} | {ts_str}", (16, 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3)
-            cv2.putText(frame, f"{cam_name} | {ts_str}", (16, 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
-
-            # 4. Aufnahme verarbeiten (Live / Motion / 24/7)
+            # 3. Aufnahme verarbeiten (ohne künstliches Text-Overlay, da Kamera-OSD vorhanden)
             try:
                 self._handle_recording(frame, fps_estimate)
             except Exception as e:
                 print(f"[Recording] Fehler bei {cam_name}: {e}")
 
-            # 5. JPEG für Live-Stream & Sofort-Snapshots aktualisieren
+            # 4. JPEG für Live-Stream & Sofort-Snapshots aktualisieren
             ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
                 with self.lock:
@@ -502,7 +493,7 @@ def ws_discovery_scan(timeout=2.0):
                 xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
         <e:Header>
             <w:MessageID>uuid:{probe_id}</w:MessageID>
-            <w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>
+            <w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005/04/discovery</w:To>
             <w:Action a:mustUnderstand="true" xmlns:a="http://www.w3.org/2005/08/addressing">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
         </e:Header>
         <e:Body>
@@ -540,7 +531,7 @@ def ws_discovery_scan(timeout=2.0):
 
 
 def probe_host_ports(ip):
-    """Prüft typische Kamera-Ports (RTSP 554, Tapo ONVIF 2020, Hikvision 8000, ONVIF 8899/8080)."""
+    """Prüft typische Kamera-Ports (RTSP 554, Tapo ONVIF 2020, Hikvision 8000, ONVIF 8899/8554)."""
     if is_router_ip(ip):
         return None
 
@@ -703,7 +694,6 @@ def execute_onvif_ptz(cam, direction, speed=0.5):
             )
             if resp.status_code < 400:
                 if direction != "stop":
-                    # Automatischer Stopp nach 450ms für saubere Schrittsteuerung
                     threading.Timer(0.45, execute_onvif_ptz, args=(cam, "stop", 0)).start()
                 return True, "OK"
         except Exception:
@@ -759,7 +749,7 @@ def login():
             return redirect(url_for("index"))
         error = "Ungültiger Benutzername oder Passwort / Invalid credentials"
 
-    return render_template("login.html", error=error, lang=lang)
+    return render_template("login.html", error=error, lang=lang, version=APP_VERSION)
 
 
 @app.route("/logout")
@@ -774,7 +764,8 @@ def index():
     return render_template(
         "index.html",
         username=session.get("user"),
-        role=session.get("role", "readonly")
+        role=session.get("role", "readonly"),
+        version=APP_VERSION
     )
 
 
@@ -799,7 +790,6 @@ def api_bootstrap():
         if role == "admin":
             cam_copy = dict(c)
         else:
-            # Read-Only Benutzer erhalten keine Zugangsdaten oder RTSP-Passwörter
             cam_copy = {
                 "id": c["id"],
                 "name": c.get("name", "Camera"),
@@ -811,6 +801,7 @@ def api_bootstrap():
         safe_cameras.append(cam_copy)
 
     return jsonify({
+        "version": APP_VERSION,
         "user": session.get("user"),
         "role": role,
         "settings": settings if role == "admin" else {"language": settings.get("language", "en")},
@@ -827,7 +818,6 @@ def api_cameras():
             return jsonify({"error": "Forbidden"}), 403
         return jsonify(load_json(CAMERAS_FILE, []))
 
-    # POST: Kamera anlegen oder aktualisieren (Nur Admin)
     if session.get("role") != "admin":
         return jsonify({"error": "Keine Berechtigung"}), 403
 
@@ -963,7 +953,6 @@ def api_save_settings():
 
     if "recording_interval" in data:
         val = int(data["recording_interval"])
-        # Erlaubt 15-Minuten-Schritte von 15 bis 120 Minuten
         if val in (15, 30, 45, 60, 75, 90, 105, 120):
             settings["recording_interval"] = val
         else:
@@ -1025,7 +1014,6 @@ def api_delete_user(username):
     if username not in users:
         return jsonify({"error": "Benutzer nicht gefunden"}), 404
 
-    # Verhindern, dass der letzte Admin gelöscht wird
     admin_count = sum(1 for u, info in users.items() if info.get("role") == "admin")
     if users[username].get("role") == "admin" and admin_count <= 1:
         return jsonify({"error": "Der letzte Administrator kann nicht gelöscht werden"}), 400
