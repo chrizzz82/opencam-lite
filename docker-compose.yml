@@ -1,29 +1,15 @@
-# OpenCam Lite - https://github.com/chrizzz82/opencam-lite
 name: opencam-lite
 services:
   opencam-lite:
     build: .
-    image: opencam-lite:latest
+    image: ghcr.io/chrizz82/opencam-lite:latest
     container_name: opencam-lite
     restart: unless-stopped
-    # Host-Netzwerk: Kameras im LAN werden automatisch gefunden.
-    # Die Oberflaeche ist dann unter http://<server-ip>:7777 erreichbar.
     network_mode: host
     environment:
       - TZ=Europe/Berlin
       - PORT=7777
-      # Optional: GitHub-Repo fuer den Update-Check (Standard: chrizzz82/opencam-lite)
-      # - GITHUB_REPO=chrizzz82/opencam-lite
-      # Optional: Speicherlimit in GB (die aeltesten Tage werden zuerst geloescht)
-      # - MAX_STORAGE_GB=500
-      # Optional: NAS-Backup (Netzfreigabe auf dem Host einbinden, unten bei volumes durchreichen)
-      # - BACKUP_DIR=/backup
-      # - BACKUP_KEEP_DAYS=90
-      # Optional: MQTT (Topics: opencam/<Kameraname>/motion und /online)
-      # - MQTT_HOST=192.168.178.10
-      # - MQTT_USER=
-      # - MQTT_PASSWORD=
-    volumes:
+     volumes:
       - /DATA/AppData/opencam-lite/config:/config
       - /DATA/AppData/opencam-lite/recordings:/recordings
       # - /DATA/Media/Backup/opencam:/backup
