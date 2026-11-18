@@ -1,3 +1,4 @@
+# OpenCam Lite - https://github.com/chrizzz82/opencam-lite
 name: opencam-lite
 services:
   opencam-lite:
@@ -11,6 +12,8 @@ services:
     environment:
       - TZ=Europe/Berlin
       - PORT=7777
+      # Optional: GitHub-Repo fuer den Update-Check (Standard: chrizzz82/opencam-lite)
+      # - GITHUB_REPO=chrizzz82/opencam-lite
       # Optional: Speicherlimit in GB (die aeltesten Tage werden zuerst geloescht)
       # - MAX_STORAGE_GB=500
       # Optional: NAS-Backup (Netzfreigabe auf dem Host einbinden, unten bei volumes durchreichen)
