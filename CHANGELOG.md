@@ -29,3 +29,27 @@ All notable changes to OpenCam Lite will be documented in this file.
 ### Changed & Optimized
 * **Persistent Configuration:** Hardcoded Docker volume mount points for `/config` and `/recordings` ensure all settings and recordings survive container updates.
 * **UI Refinement:** Cleaned up header badge styling and version display alongside the project title.
+
+* 
+## v0.3.0
+
+### Added
+- **Live archive:** Recordings can now be searched, played back and exported while they are still being written. Play, MP4 and GIF work for the current block, no need to wait until it is finished.
+  - The recorder now writes fragmented MP4 through ffmpeg (same MPEG-4 codec as before), so the running file is readable at any time. If ffmpeg fails, the cause is logged and recording falls back to the previous OpenCV writer.
+  - Running recordings are played back as on-demand H.264 clips (5 min per segment, continues automatically) and are cached for 60 s.
+- **Per-camera folders:** Recordings are stored in `recordings/<date>/<CameraName>_<id>/`. The folder stays the same if a camera is renamed. Existing recordings in the flat day folder are moved into camera folders automatically on startup. ZIP export keeps the folder structure.
+- **Live mode with motion zones:** A camera set to "Live" that has motion zones configured now records on motion in those zones (like "Motion" mode). Without zones, "Live" stays live-only.
+- **Diagnostics:** When no recording is found, the timeline now shows which files the server returned. `/api/status` reports `live_archive: true`, and the startup log prints `Live-Archiv aktiv`.
+
+### Changed
+- Event "Play" from the gallery or event list always jumps into the recording, even for events within the last 20 seconds (previously it fell back to the live view).
+- Odd video resolutions are padded to even dimensions so the ffmpeg recorder never fails on them.
+
+### Fixed
+- **"No recording" for every event:** Recordings were not listed in the archive when the camera name contained characters like spaces or parentheses (e.g. `TP-Link Tapo Camera (192.168.1.5)`), because the file name was parsed from the wrong position. Date, time and mode are now read from the end of the file name.
+- GIF/MP4 export failed with "Keine Aufnahme" for events in the current block.
+
+### Upgrade notes
+- ffmpeg must be available in the container (already required for the post-recording conversion).
+- Restarting ends the current block. The unfinished file from before the update is not readable and is discarded on startup; a new block starts in the camera folder.
+- Docker: rebuild the image or copy `server.py` and `index.html` into the container, otherwise the old code keeps running.
