@@ -7,7 +7,10 @@ import json
 import uuid
 import base64
 import socket
+import subprocess
+import queue
 import shutil
+import tempfile
 import zipfile
 import hashlib
 import threading
@@ -18,11 +21,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from flask import (
     Flask, Response, render_template, request, jsonify,
-    session, redirect, url_for, send_file, abort
+    session, redirect, url_for, send_file, abort, after_this_request
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-APP_VERSION = "v0.2.1"
+APP_VERSION = "v0.3.0"
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "chrizzz82/opencam-lite")
 PORT = int(os.environ.get("PORT", 7777))
 
@@ -31,13 +34,38 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;50000
 
 TEMPLATE_DIR = "templates" if os.path.isdir("templates") and os.path.exists(os.path.join("templates", "index.html")) else "."
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
-app.secret_key = os.environ.get("SECRET_KEY", "opencam_lite_secret_key_2026")
 
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
 RECORDINGS_DIR = os.environ.get("RECORDINGS_DIR", "/recordings")
 
 os.makedirs(CONFIG_DIR, exist_ok=True)
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
+
+
+def load_or_create_secret_key():
+    """SECRET_KEY aus Umgebung, sonst einmalig zufaellig erzeugen und in /config speichern."""
+    env_key = os.environ.get("SECRET_KEY", "").strip()
+    if env_key:
+        return env_key
+    key_file = os.path.join(CONFIG_DIR, "secret.key")
+    try:
+        with open(key_file, encoding="utf-8") as f:
+            key = f.read().strip()
+        if key:
+            return key
+    except OSError:
+        pass
+    key = uuid.uuid4().hex + uuid.uuid4().hex
+    try:
+        with open(key_file, "w", encoding="utf-8") as f:
+            f.write(key)
+        os.chmod(key_file, 0o600)
+    except OSError:
+        pass
+    return key
+
+
+app.secret_key = load_or_create_secret_key()
 
 USERS_FILE = os.path.join(CONFIG_DIR, "users.json")
 CAMERAS_FILE = os.path.join(CONFIG_DIR, "cameras.json")
@@ -183,7 +211,409 @@ def ensure_daily_folders():
         os.makedirs(day_path, exist_ok=True)
 
 
+EVENT_LOCK = threading.Lock()
+TRANSCODE_SEM = threading.Semaphore(1)
+CLIP_SEM = threading.Semaphore(2)
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def log_event(cam_id, cam_name, ev_type, ts=None, extra=None):
+    """Schreibt Ereignisse (motion_start/_end, offline_start/_end) in <tag>/events.jsonl."""
+    when = datetime.datetime.fromtimestamp(ts) if ts else datetime.datetime.now()
+    day = os.path.join(RECORDINGS_DIR, when.strftime("%Y-%m-%d"))
+    try:
+        os.makedirs(day, exist_ok=True)
+        line = json.dumps({"ts": when.timestamp(), "cam_id": cam_id, "cam": cam_name, "type": ev_type, **(extra or {})})
+        with EVENT_LOCK:
+            with open(os.path.join(day, "events.jsonl"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        print(f"[Events] Fehler: {e}")
+
+
+def load_events(date_str):
+    path = os.path.join(RECORDINGS_DIR, date_str, "events.jsonl")
+    midnight = datetime.datetime.strptime(date_str, "%Y-%m-%d").timestamp()
+    now_sec = (time.time() - midnight) if date_str == datetime.date.today().isoformat() else 86400.0
+    opened, snaps, out = {}, {}, []
+
+    def make(key, start, end):
+        ev = {"cam_id": key[0], "type": key[1], "start": start, "end": end}
+        if snaps.get(key):
+            ev["snap"] = snaps[key]
+        return ev
+
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    kind, _, edge = e["type"].rpartition("_")
+                    sec = max(0.0, min(86400.0, float(e["ts"]) - midnight))
+                except (ValueError, KeyError):
+                    continue
+                key = (e.get("cam_id"), kind)
+                if edge == "start":
+                    if key in opened:  # alter Start ohne Ende (z.B. Neustart)
+                        out.append(make(key, opened[key], opened[key] + 1))
+                    opened[key] = sec
+                    snaps[key] = e.get("snap")
+                elif edge == "end" and key in opened:
+                    start = opened.pop(key)
+                    out.append(make(key, start, max(sec, start + 1)))
+    for key, start in opened.items():
+        w = camera_workers.get(key[0])
+        live = bool(w and w.evt_open.get(key[1]))
+        out.append(make(key, start, max(start + 1, now_sec) if live else start + 1))
+    return out
+
+
+def save_snapshot(cam_id, frame):
+    """Speichert beim Start einer Bewegung ein Vorschaubild (Privatzonen sind bereits geschwaerzt)."""
+    now = datetime.datetime.now()
+    folder = os.path.join(RECORDINGS_DIR, now.strftime("%Y-%m-%d"), "snapshots")
+    name = f"{cam_id}__{now.strftime('%H-%M-%S')}.jpg"
+    try:
+        os.makedirs(folder, exist_ok=True)
+        h, w = frame.shape[:2]
+        if w > 640:
+            frame = cv2.resize(frame, (640, int(h * 640 / w)))
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
+        if ok:
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(buf.tobytes())
+            return name
+    except Exception as e:
+        print(f"[Snapshot] Fehler: {e}")
+    return None
+
+
+# ---- NAS-Backup: abgeschlossene Tage auf ein eingebundenes Laufwerk spiegeln -------------------
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "").strip()
+BACKUP_KEEP_DAYS = int(os.environ.get("BACKUP_KEEP_DAYS", "0") or 0)
+BACKUP_STATE = {"last_run": None, "last_error": "", "files": 0}
+BACKUP_LOCK = threading.Lock()
+
+
+def backup_old_recordings():
+    """Kopiert alle Tage vor heute nach BACKUP_DIR (nur Neues/Geaendertes) und raeumt dort nach BACKUP_KEEP_DAYS auf."""
+    if not BACKUP_DIR:
+        return
+    if not BACKUP_LOCK.acquire(blocking=False):
+        return
+    copied = 0
+    try:
+        if not os.path.isdir(BACKUP_DIR):
+            raise OSError("Backup-Ziel nicht erreichbar")
+        today = datetime.date.today()
+        for day in sorted(d for d in os.listdir(RECORDINGS_DIR) if DATE_RE.match(d) and d < today.isoformat()):
+            src_day = os.path.join(RECORDINGS_DIR, day)
+            for root, _, files in os.walk(src_day):
+                target = os.path.normpath(os.path.join(BACKUP_DIR, day, os.path.relpath(root, src_day)))
+                os.makedirs(target, exist_ok=True)
+                for fname in files:
+                    if fname.endswith((".rec.mp4", ".part")):
+                        continue
+                    src, dst = os.path.join(root, fname), os.path.join(target, fname)
+                    st = os.stat(src)
+                    if os.path.exists(dst):
+                        ds = os.stat(dst)
+                        if ds.st_size == st.st_size and ds.st_mtime >= st.st_mtime - 2:
+                            continue
+                    shutil.copy2(src, dst + ".part")   # erst .part, dann umbenennen: kein halbes File im Backup
+                    os.replace(dst + ".part", dst)
+                    copied += 1
+        if BACKUP_KEEP_DAYS > 0:
+            limit = (today - datetime.timedelta(days=BACKUP_KEEP_DAYS)).isoformat()
+            for day in os.listdir(BACKUP_DIR):
+                if DATE_RE.match(day) and day < limit:
+                    shutil.rmtree(os.path.join(BACKUP_DIR, day), ignore_errors=True)
+        BACKUP_STATE.update(last_run=time.time(), last_error="", files=copied)
+    except Exception as e:
+        BACKUP_STATE.update(last_run=time.time(), last_error=str(e)[:200], files=copied)
+        print(f"[Backup] Fehler: {e}")
+    finally:
+        BACKUP_LOCK.release()
+
+
+# ---- MQTT (ohne Zusatzpaket): Bewegung und Online-Status, z.B. fuer Home Assistant -------------
+MQTT_HOST = os.environ.get("MQTT_HOST", "").strip()
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883") or 1883)
+MQTT_USER = os.environ.get("MQTT_USER", "")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
+MQTT_PREFIX = os.environ.get("MQTT_PREFIX", "opencam").strip("/") or "opencam"
+_mqtt_queue = queue.Queue(maxsize=200)
+
+
+def _mqtt_str(text):
+    raw = text.encode("utf-8")
+    return len(raw).to_bytes(2, "big") + raw
+
+
+def _mqtt_packet(first_byte, body):
+    n, length = len(body), bytearray()
+    while True:
+        digit, n = n % 128, n // 128
+        length.append(digit | (0x80 if n else 0))
+        if not n:
+            break
+    return bytes([first_byte]) + bytes(length) + body
+
+
+def _mqtt_send(topic, payload, retain):
+    flags = 0x02 | (0x80 if MQTT_USER else 0) | (0x40 if MQTT_USER and MQTT_PASSWORD else 0)
+    connect = _mqtt_str("MQTT") + bytes([4, flags]) + (30).to_bytes(2, "big") + _mqtt_str("opencam-" + uuid.uuid4().hex[:8])
+    if MQTT_USER:
+        connect += _mqtt_str(MQTT_USER)
+    if MQTT_USER and MQTT_PASSWORD:
+        connect += _mqtt_str(MQTT_PASSWORD)
+    with socket.create_connection((MQTT_HOST, MQTT_PORT), timeout=5) as sock:
+        sock.sendall(_mqtt_packet(0x10, connect))
+        ack = sock.recv(4)
+        if len(ack) < 4 or ack[0] != 0x20 or ack[3] != 0:
+            raise OSError("MQTT-Verbindung abgelehnt")
+        sock.sendall(_mqtt_packet(0x30 | (1 if retain else 0), _mqtt_str(topic) + payload.encode("utf-8")))
+        sock.sendall(b"\xe0\x00")   # DISCONNECT
+
+
+def _mqtt_worker():
+    while True:
+        topic, payload, retain = _mqtt_queue.get()
+        try:
+            _mqtt_send(topic, payload, retain)
+        except Exception as e:
+            print(f"[MQTT] Fehler: {e}")
+
+
+def mqtt_publish(topic, payload, retain=True):
+    if MQTT_HOST:
+        try:
+            _mqtt_queue.put_nowait((topic, str(payload), retain))
+        except queue.Full:
+            pass
+
+
+if MQTT_HOST:
+    threading.Thread(target=_mqtt_worker, daemon=True).start()
+
+
+def finalize_recording(rec_path):
+    """Wandelt die mp4v-Rohdatei in browserfaehiges H.264 (faststart) um."""
+    final = rec_path[:-len(".rec.mp4")] + ".mp4"
+    part = final + ".part"
+    with TRANSCODE_SEM:
+        try:
+            if not os.path.isfile(rec_path):
+                return
+            st = os.stat(rec_path)
+            cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", rec_path,
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
+                   "-an", "-movflags", "+faststart", "-f", "mp4", part]
+            res = subprocess.run(cmd, capture_output=True, timeout=4 * 3600)
+            if res.returncode == 0 and os.path.getsize(part) > 1024:
+                os.utime(part, (st.st_atime, st.st_mtime))  # Endzeit bleibt erhalten
+                os.replace(part, final)
+                os.remove(rec_path)
+                return
+            print(f"[Transcode] ffmpeg Fehler: {res.stderr.decode(errors='ignore')[:300]}")
+        except Exception as e:
+            print(f"[Transcode] Fehler: {e}")
+        try:  # Fallback: Rohdatei behalten, falls sie lesbar ist
+            if os.path.exists(part):
+                os.remove(part)
+            cap = cv2.VideoCapture(rec_path)
+            valid = cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0
+            cap.release()
+            if valid:
+                os.replace(rec_path, final)
+            else:
+                os.remove(rec_path)
+        except Exception as e:
+            print(f"[Transcode] Fallback-Fehler: {e}")
+
+
+def find_leftovers():
+    found = []
+    try:
+        for day in os.listdir(RECORDINGS_DIR):
+            d = os.path.join(RECORDINGS_DIR, day)
+            if DATE_RE.match(day) and os.path.isdir(d):
+                for root, _, files in os.walk(d):
+                    found += [os.path.join(root, f) for f in files if f.endswith(".rec.mp4")]
+    except Exception as e:
+        print(f"[Recovery] Fehler: {e}")
+    return found
+
+
+def parse_clock(value, default, is_end=False):
+    try:
+        p = [int(x) for x in value.strip().split(":")]
+        return p[0] * 3600 + p[1] * 60 + (p[2] if len(p) > 2 else (59 if is_end else 0))
+    except Exception:
+        return default
+
+
+def camera_folder(day_dir, cam_id, name):
+    """Unterordner pro Kamera: <Name>_<ID>. Bleibt auch nach Umbenennen der Kamera derselbe (Suche ueber die ID)."""
+    cid = re.sub(r"[^a-zA-Z0-9_-]", "_", str(cam_id))
+    try:
+        for d in sorted(os.listdir(day_dir)):
+            if d.endswith("_" + cid) and os.path.isdir(os.path.join(day_dir, d)):
+                return d
+    except OSError:
+        pass
+    base = re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_-]", "_", name or "Cam")).strip("_") or "Cam"
+    return f"{base}_{cid}"
+
+
+def iter_rec_files(day_dir):
+    """(Unterordner, Dateiname) aller Dateien eines Tages: Kamera-Ordner und alte flache Ablage (Unterordner '')."""
+    out = []
+    try:
+        entries = os.listdir(day_dir)
+    except OSError:
+        return out
+    for e in entries:
+        p = os.path.join(day_dir, e)
+        if os.path.isdir(p):
+            if e == "snapshots":
+                continue
+            try:
+                out += [(e, f) for f in os.listdir(p)]
+            except OSError:
+                pass
+        else:
+            out.append(("", e))
+    return out
+
+
+def find_rec_file(date_str, filename):
+    """Pfad einer Aufnahme (Kamera-Ordner oder alte flache Ablage) oder None."""
+    day_dir = os.path.join(RECORDINGS_DIR, date_str)
+    p = os.path.join(day_dir, filename)
+    if os.path.isfile(p):
+        return p
+    try:
+        for d in os.listdir(day_dir):
+            p = os.path.join(day_dir, d, filename)
+            if d != "snapshots" and os.path.isfile(p):
+                return p
+    except OSError:
+        pass
+    return None
+
+
+def organize_legacy_recordings():
+    """Einmalig: fertige Aufnahmen aus der alten flachen Ablage in Kamera-Ordner verschieben."""
+    try:
+        for day in os.listdir(RECORDINGS_DIR):
+            day_dir = os.path.join(RECORDINGS_DIR, day)
+            if not (DATE_RE.match(day) and os.path.isdir(day_dir)):
+                continue
+            for sub, fname in iter_rec_files(day_dir):
+                if sub or not fname.endswith(".mp4") or fname.endswith(".rec.mp4"):
+                    continue
+                parsed = parse_rec_name(fname[:-4])
+                if not parsed:
+                    continue
+                dst_dir = os.path.join(day_dir, camera_folder(day_dir, parsed[0], parsed[1]))
+                os.makedirs(dst_dir, exist_ok=True)
+                os.replace(os.path.join(day_dir, fname), os.path.join(dst_dir, fname))
+    except Exception as e:
+        print(f"[Archiv] Sortieren nach Kamera: {e}")
+
+
+def parse_rec_name(base):
+    """<cam_id>__<Name>__<HH-MM-SS>__<TAG>: Uhrzeit/Tag von rechts lesen, da der Kameraname selbst '__' enthalten kann
+    (z.B. 'TP-Link Tapo Camera (192.168.1.5)')."""
+    m = re.search(r"(\d{2})-(\d{2})-(\d{2})__([A-Za-z0-9]+)$", base)
+    if not m:
+        return None
+    cam_id, sep, name = base[:m.start()].partition("__")
+    if not sep or not cam_id:
+        return None
+    return cam_id, name.strip("_"), int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)), m.group(4)
+
+
+def list_recordings(date_str, cam_filter="", from_sec=0, to_sec=86400):
+    """Aufnahmen eines Tages (aufsteigend). Filter = zeitliche Ueberlappung, nicht nur Startzeit."""
+    day_dir = os.path.join(RECORDINGS_DIR, date_str)
+    if not os.path.isdir(day_dir):
+        return []
+    midnight = datetime.datetime.strptime(date_str, "%Y-%m-%d").timestamp()
+    active = {w.current_filepath for w in list(camera_workers.values()) if w.current_filepath}
+    files = iter_rec_files(day_dir)
+    names = set(files)
+    out = []
+    for sub, fname in files:
+        if not fname.endswith(".mp4"):
+            continue
+        raw = fname.endswith(".rec.mp4")
+        base = fname[:-8] if raw else fname[:-4]
+        if raw and (sub, base + ".mp4") in names:
+            continue
+        parsed = parse_rec_name(base)
+        if not parsed:
+            continue
+        try:
+            fpath = os.path.join(day_dir, sub, fname)
+            st = os.stat(fpath)
+        except OSError:
+            continue
+        rec_cam, rec_name, start, rec_tag = parsed
+        status = ("recording" if fpath in active else "processing") if raw else "ready"
+        end = (time.time() if status == "recording" else st.st_mtime) - midnight
+        end = max(start + 1, min(86400.0, end))
+        if cam_filter and rec_cam != cam_filter:
+            continue
+        if not (start < to_sec and end > from_sec):
+            continue
+        out.append({
+            "date": date_str, "filename": fname, "dir": sub, "camera_id": rec_cam,
+            "camera_name": rec_name.replace("_", " "), "mode": rec_tag,
+            "size_mb": round(st.st_size / (1024 * 1024), 2),
+            "start_sec": start, "end_sec": round(end, 1), "status": status,
+        })
+    out.sort(key=lambda r: r["start_sec"])
+    return out
+
+
+def dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
 def cleanup_old_recordings():
+    """Loescht nach Alter (retention_days) und danach die aeltesten Tage, bis das GB-Limit eingehalten ist."""
+    if BACKUP_DIR:
+        threading.Thread(target=backup_old_recordings, daemon=True).start()
+    _cleanup_by_age()
+    try:
+        settings = load_json(SETTINGS_FILE, {})
+        cap_gb = float(settings.get("max_storage_gb") or os.environ.get("MAX_STORAGE_GB") or 0)
+        if cap_gb <= 0:
+            return
+        today = datetime.date.today().isoformat()
+        total = dir_size(RECORDINGS_DIR)
+        for day in sorted(d for d in os.listdir(RECORDINGS_DIR) if DATE_RE.match(d) and d < today):
+            if total <= cap_gb * 1024 ** 3:
+                break
+            p = os.path.join(RECORDINGS_DIR, day)
+            size = dir_size(p)
+            shutil.rmtree(p, ignore_errors=True)
+            total -= size
+            print(f"[Cleanup] Speicherlimit: {day} geloescht")
+    except Exception as e:
+        print(f"[Cleanup] Limit-Fehler: {e}")
+
+
+def _cleanup_by_age():
     settings = load_json(SETTINGS_FILE, {})
     retention_days = int(settings.get("retention_days", 7))
     if retention_days <= 0:
@@ -239,6 +669,81 @@ def trigger_motion_alert(cam_name, cam_id):
 # SINGLE RTSP CONNECTION WORKER (LIVE + MOTION + 24/7 + WATCHDOG)
 # ==============================================================================
 
+class LiveMp4Writer:
+    """Ersatz fuer cv2.VideoWriter: schreibt ueber ffmpeg ein fragmentiertes MP4 (MPEG-4, wie bisher),
+    das schon WAEHREND der Aufnahme lesbar ist (Live-Archiv). Gleiche Schnittstelle wie cv2.VideoWriter.
+    Faellt ffmpeg aus, wird der Grund geloggt und mit dem alten OpenCV-Writer weitergeschrieben."""
+
+    def __init__(self, path, fps, w, h):
+        self.path, self.fps, self.w, self.h = path, fps, w, h
+        self.proc, self.cv, self.err = None, None, None
+        try:
+            self.err = tempfile.TemporaryFile()
+            self.proc = subprocess.Popen(
+                ["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+                 "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-framerate", f"{fps:.3f}", "-i", "-",
+                 "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                 "-c:v", "mpeg4", "-q:v", "5", "-g", "15", "-pix_fmt", "yuv420p", "-an",
+                 "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-flush_packets", "1",
+                 "-f", "mp4", path],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.err)
+        except Exception as e:
+            print(f"[Recorder] ffmpeg konnte nicht gestartet werden: {e}")
+            self.proc = None
+
+    def _fallback(self):
+        """ffmpeg-Writer ausgefallen -> Fehler loggen, OpenCV-Writer (ohne Live-Lesbarkeit) verwenden."""
+        if self.cv is not None:
+            return
+        reason = ""
+        try:
+            self.err.seek(0)
+            reason = self.err.read().decode(errors="ignore")[-300:].strip()
+        except Exception:
+            pass
+        print(f"[Recorder] ffmpeg-Writer ausgefallen ({reason or 'unbekannt'}) -> OpenCV-Fallback fuer {os.path.basename(self.path)}")
+        self.proc = None
+        self.cv = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (self.w, self.h))
+
+    def isOpened(self):
+        if self.cv is not None:
+            return self.cv.isOpened()
+        return self.proc is not None and self.proc.poll() is None
+
+    def write(self, frame):
+        if frame.shape[1] != self.w or frame.shape[0] != self.h:
+            return
+        if self.cv is None and (self.proc is None or self.proc.poll() is not None):
+            self._fallback()
+        if self.cv is not None:
+            self.cv.write(frame)
+            return
+        try:
+            self.proc.stdin.write(frame.tobytes())
+        except Exception:
+            pass
+
+    def release(self):
+        if self.cv is not None:
+            self.cv.release()
+            self.cv = None
+        if self.proc is not None:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=30)
+            except Exception:
+                self.proc.kill()
+            self.proc = None
+        try:
+            if self.err:
+                self.err.close()
+        except Exception:
+            pass
+
+
 class CameraStreamWorker:
     def __init__(self, cam_config):
         self.config = cam_config
@@ -257,9 +762,33 @@ class CameraStreamWorker:
         self.current_rec_start = 0
         self.current_rec_date = ""
         self.current_rec_mode = ""
+        self.current_filepath = ""
+        self.evt_open = {"motion": False, "offline": False}
+        self.offline_since = 0
 
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
+
+    def _event(self, kind, active, ts=None, frame=None):
+        if self.evt_open[kind] == active:
+            return
+        self.evt_open[kind] = active
+        name = self.config.get("name", "Camera")
+        extra = {}
+        if kind == "motion" and active and frame is not None:
+            snap = save_snapshot(self.cam_id, frame)
+            if snap:
+                extra["snap"] = snap
+        log_event(self.cam_id, name, f"{kind}_{'start' if active else 'end'}", ts, extra)
+        topic = f"{MQTT_PREFIX}/{re.sub(r'[^a-zA-Z0-9_-]', '_', name)}"
+        if kind == "motion":
+            mqtt_publish(f"{topic}/motion", "ON" if active else "OFF")
+        elif kind == "offline":
+            mqtt_publish(f"{topic}/online", "OFF" if active else "ON")
+
+    def _close_events(self):
+        for kind in ("motion", "offline"):
+            self._event(kind, False)
 
     def update_config(self, new_config):
         with self.lock:
@@ -271,6 +800,7 @@ class CameraStreamWorker:
     def stop(self):
         self.running = False
         self._close_writer()
+        self._close_events()
 
     def get_jpeg(self):
         with self.lock:
@@ -312,6 +842,7 @@ class CameraStreamWorker:
         _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
 
         h, w = thresh.shape[:2]
+        area = float(h * w)
         if motion_zones:
             mask = np.zeros((h, w), dtype=np.uint8)
             for z in motion_zones:
@@ -324,9 +855,10 @@ class CameraStreamWorker:
                 except Exception:
                     pass
             thresh = cv2.bitwise_and(thresh, mask)
+            area = float(max(1, cv2.countNonZero(mask)))   # Zonenflaeche, nicht das ganze Bild
 
         changed_pixels = cv2.countNonZero(thresh)
-        total_pixels = float(h * w)
+        total_pixels = area
         sens = max(1, min(100, int(sensitivity or 50)))
         required_ratio = 0.05 * ((101 - sens) / 100.0) * 0.5 + 0.0005
         return (changed_pixels / total_pixels) >= required_ratio
@@ -338,6 +870,9 @@ class CameraStreamWorker:
             except Exception:
                 pass
             self.writer = None
+            path, self.current_filepath = self.current_filepath, ""
+            if path:
+                threading.Thread(target=finalize_recording, args=(path,), daemon=True).start()
 
     def _handle_recording(self, frame, fps):
         settings = load_json(SETTINGS_FILE, {})
@@ -347,6 +882,8 @@ class CameraStreamWorker:
         post_buffer = int(settings.get("motion_post_buffer", 15))
 
         mode = self.config.get("recording_mode", "live")
+        if mode == "live" and self.config.get("motion_zones"):
+            mode = "motion"   # Live + eingerichtete Bewegungszonen: nur bei Bewegung in den Zonen aufnehmen
         now = time.time()
         dt_now = datetime.datetime.now()
         today_str = dt_now.strftime("%Y-%m-%d")
@@ -375,16 +912,18 @@ class CameraStreamWorker:
             safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", self.config.get("name", "Cam"))
             time_str = dt_now.strftime("%H-%M-%S")
             tag = "MOTION" if mode == "motion" else "24x7"
-            filename = f"{self.cam_id}__{safe_name}__{time_str}__{tag}.mp4"
-            filepath = os.path.join(day_folder, filename)
+            filename = f"{self.cam_id}__{safe_name}__{time_str}__{tag}.rec.mp4"
+            cam_dir = os.path.join(day_folder, camera_folder(day_folder, self.cam_id, safe_name))
+            os.makedirs(cam_dir, exist_ok=True)
+            filepath = os.path.join(cam_dir, filename)
 
             h, w = frame.shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             out_fps = max(5.0, min(30.0, float(fps if fps and fps > 0 else 15.0)))
-            self.writer = cv2.VideoWriter(filepath, fourcc, out_fps, (w, h))
+            self.writer = LiveMp4Writer(filepath, out_fps, w, h)
             self.current_rec_start = now
             self.current_rec_date = today_str
             self.current_rec_mode = mode
+            self.current_filepath = filepath
 
         if self.writer is not None and self.writer.isOpened():
             self.writer.write(frame)
@@ -405,6 +944,10 @@ class CameraStreamWorker:
 
             if cap is None or not cap.isOpened() or (time.time() - self.last_frame_time > 25.0):
                 self.connected = False
+                if not self.offline_since:
+                    self.offline_since = time.time()
+                if time.time() - self.offline_since > 10:
+                    self._event("offline", True, self.offline_since)
                 self._close_writer()
                 if cap is not None:
                     try:
@@ -432,6 +975,8 @@ class CameraStreamWorker:
             now = time.time()
             self.last_frame_time = now
             self.connected = True
+            self.offline_since = 0
+            self._event("offline", False)
             self.latest_raw_shape = frame.shape[:2]
 
             cam_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -466,6 +1011,11 @@ class CameraStreamWorker:
                         daemon=True
                     ).start()
 
+            if is_moving:
+                self._event("motion", True, frame=frame)
+            elif self.evt_open["motion"] and now - self.last_motion_time > 5:
+                self._event("motion", False)
+
             try:
                 self._handle_recording(frame, fps_estimate)
             except Exception as e:
@@ -477,6 +1027,7 @@ class CameraStreamWorker:
                     self.latest_jpeg = buffer.tobytes()
 
         self._close_writer()
+        self._close_events()
         if cap is not None:
             try:
                 cap.release()
@@ -513,6 +1064,9 @@ def background_housekeeping():
         time.sleep(900)
 
 
+print("[OpenCam] Live-Archiv aktiv (laufende Aufnahmen sind abspielbar)")
+_leftovers = find_leftovers()
+threading.Thread(target=lambda: ([finalize_recording(p) for p in _leftovers], organize_legacy_recordings()), daemon=True).start()
 sync_camera_workers()
 threading.Thread(target=background_housekeeping, daemon=True).start()
 
@@ -789,6 +1343,40 @@ def admin_required(f):
     return decorated
 
 
+LOGIN_FAILS = {}
+LOGIN_LOCK = threading.Lock()
+_STATUS_CACHE = {"t": 0.0, "size": 0}
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True})
+
+
+@app.route("/api/status")
+@admin_required
+def api_status():
+    if time.time() - _STATUS_CACHE["t"] > 60:   # Ordnergroesse nur einmal pro Minute berechnen
+        _STATUS_CACHE.update(t=time.time(), size=dir_size(RECORDINGS_DIR))
+    usage = shutil.disk_usage(RECORDINGS_DIR)
+    settings = load_json(SETTINGS_FILE, {})
+    return jsonify({
+        "disk_total": usage.total, "disk_free": usage.free, "recordings_bytes": _STATUS_CACHE["size"],
+        "max_storage_gb": float(settings.get("max_storage_gb") or os.environ.get("MAX_STORAGE_GB") or 0),
+        "retention_days": int(settings.get("retention_days", 7)),
+        "backup": {"enabled": bool(BACKUP_DIR), **BACKUP_STATE},
+        "mqtt": bool(MQTT_HOST),
+        "live_archive": True   # Marker: Live-Archiv-Version laeuft
+    })
+
+
+def login_blocked(ip):
+    now = time.time()
+    with LOGIN_LOCK:
+        LOGIN_FAILS[ip] = [t for t in LOGIN_FAILS.get(ip, []) if now - t < 600]
+        return len(LOGIN_FAILS[ip]) >= 5
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
@@ -799,11 +1387,19 @@ def login():
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
         users = load_json(USERS_FILE, {})
+        ip = request.remote_addr or "?"
+
+        if login_blocked(ip):
+            error = "Zu viele Fehlversuche, bitte 10 Minuten warten / Too many attempts, please wait 10 minutes"
+            return render_template("login.html", error=error, lang=lang, version=APP_VERSION), 429
 
         if username in users and check_password_hash(users[username]["password_hash"], password):
+            LOGIN_FAILS.pop(ip, None)
             session["user"] = username
             session["role"] = users[username].get("role", "readonly")
             return redirect(url_for("index"))
+        with LOGIN_LOCK:
+            LOGIN_FAILS.setdefault(ip, []).append(time.time())
         error = "Ungültiger Benutzername oder Passwort / Invalid credentials"
 
     return render_template("login.html", error=error, lang=lang, version=APP_VERSION)
@@ -929,8 +1525,8 @@ def api_cameras():
         "recording_mode": rec_mode,
         "ptz_enabled": bool(data.get("ptz_enabled", True)),
         "motion_sensitivity": int(data.get("motion_sensitivity", existing.get("motion_sensitivity", 50) if existing else 50)),
-        "privacy_zones": data.get("privacy_zones", existing.get("privacy_zones", []) if existing else []),
-        "motion_zones": data.get("motion_zones", existing.get("motion_zones", []) if existing else [])
+        "privacy_zones": clean_zones(data.get("privacy_zones", existing.get("privacy_zones", []) if existing else [])),
+        "motion_zones": clean_zones(data.get("motion_zones", existing.get("motion_zones", []) if existing else []))
     }
 
     if existing:
@@ -972,6 +1568,32 @@ def api_camera_mode(cam_id):
     return jsonify({"status": "ok", "recording_mode": mode})
 
 
+def clean_zones(zones):
+    """Nur gueltige Rechtecke (0..1, relativ zum Bild) behalten."""
+    out = []
+    for z in (zones if isinstance(zones, list) else [])[:50]:
+        try:
+            x = min(1.0, max(0.0, float(z["x"])))
+            y = min(1.0, max(0.0, float(z["y"])))
+            w = min(1.0 - x, max(0.0, float(z["w"])))
+            h = min(1.0 - y, max(0.0, float(z["h"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if w > 0.005 and h > 0.005:
+            out.append({"x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4)})
+    return out
+
+
+@app.route("/api/live-status")
+@login_required
+def api_live_status():
+    out = {}
+    with workers_lock:
+        for cid, w in camera_workers.items():
+            out[cid] = {"online": bool(w.connected), "motion": bool(w.motion_detected), "recording": w.writer is not None}
+    return jsonify(out)
+
+
 @app.route("/api/cameras/<cam_id>/zones", methods=["POST"])
 @admin_required
 def api_camera_zones(cam_id):
@@ -980,11 +1602,14 @@ def api_camera_zones(cam_id):
     for c in cameras:
         if c["id"] == cam_id:
             if "privacy_zones" in data:
-                c["privacy_zones"] = data["privacy_zones"]
+                c["privacy_zones"] = clean_zones(data["privacy_zones"])
             if "motion_zones" in data:
-                c["motion_zones"] = data["motion_zones"]
+                c["motion_zones"] = clean_zones(data["motion_zones"])
             if "motion_sensitivity" in data:
-                c["motion_sensitivity"] = int(data["motion_sensitivity"])
+                try:
+                    c["motion_sensitivity"] = max(1, min(100, int(data["motion_sensitivity"])))
+                except (TypeError, ValueError):
+                    pass
             break
     save_json(CAMERAS_FILE, cameras)
     sync_camera_workers()
@@ -1147,55 +1772,170 @@ def api_snapshot(cam_id):
 @admin_required
 def api_archive_list():
     ensure_daily_folders()
-    date_filter = request.args.get("date", "").strip()
-    time_from = request.args.get("from", "00:00").strip() or "00:00"
-    time_to = request.args.get("to", "23:59").strip() or "23:59"
-    cam_filter = request.args.get("camera_id", "").strip()
-
+    today = datetime.date.today().isoformat()
+    # ensure_daily_folders legt auch den morgigen Ordner an -> Zukunft nicht anzeigen
     available_dates = sorted(
-        [d for d in os.listdir(RECORDINGS_DIR) if os.path.isdir(os.path.join(RECORDINGS_DIR, d)) and re.match(r"^\d{4}-\d{2}-\d{2}$", d)],
+        [d for d in os.listdir(RECORDINGS_DIR)
+         if DATE_RE.match(d) and d <= today and os.path.isdir(os.path.join(RECORDINGS_DIR, d))],
         reverse=True
     )
+    if today not in available_dates:
+        available_dates.insert(0, today)
+    date_filter = request.args.get("date", "").strip()
+    if date_filter not in available_dates:
+        date_filter = today
+    cam_filter = request.args.get("camera_id", "").strip()
+    t_from = parse_clock(request.args.get("from", ""), 0)
+    t_to = parse_clock(request.args.get("to", ""), 86400, is_end=True)
+    if t_to <= t_from:
+        t_from, t_to = 0, 86400
 
-    if not date_filter and available_dates:
-        date_filter = available_dates[0]
-
-    files_list = []
-    target_dir = os.path.join(RECORDINGS_DIR, date_filter) if date_filter else None
-
-    if target_dir and os.path.isdir(target_dir):
-        for fname in sorted(os.listdir(target_dir), reverse=True):
-            if not fname.endswith(".mp4"):
-                continue
-            fpath = os.path.join(target_dir, fname)
-            parts = fname[:-4].split("__")
-            cid = parts[0] if len(parts) > 0 else "unknown"
-            cname = parts[1] if len(parts) > 1 else cid
-            t_raw = parts[2] if len(parts) > 2 else "00-00-00"
-            mode_tag = parts[3] if len(parts) > 3 else "REC"
-
-            hh_mm = t_raw[:5].replace("-", ":")
-            if cam_filter and cid != cam_filter:
-                continue
-            if not (time_from <= hh_mm <= time_to):
-                continue
-
-            size_mb = round(os.path.getsize(fpath) / (1024 * 1024), 2)
-            files_list.append({
-                "date": date_filter,
-                "filename": fname,
-                "camera_id": cid,
-                "camera_name": cname.replace("_", " "),
-                "time": t_raw.replace("-", ":"),
-                "mode": mode_tag,
-                "size_mb": size_mb
-            })
-
+    events = [e for e in load_events(date_filter)
+              if (not cam_filter or e["cam_id"] == cam_filter) and e["start"] < t_to and e["end"] > t_from]
+    now_sec = None
+    if date_filter == today:
+        now_sec = time.time() - datetime.datetime.strptime(today, "%Y-%m-%d").timestamp()
     return jsonify({
         "available_dates": available_dates,
         "selected_date": date_filter,
-        "recordings": files_list
+        "recordings": list_recordings(date_filter, cam_filter, t_from, t_to),
+        "events": events,
+        "window": {"from": t_from, "to": t_to},
+        "now_sec": now_sec
     })
+
+
+def probe_duration(path):
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+CLIP_CACHE_DIR = os.path.join(tempfile.gettempdir(), "opencam_live_clips")
+
+
+def probe_live_duration(path):
+    """Dauer einer (noch wachsenden) fragmentierten MP4: ffprobe, sonst Paket-Durchlauf ohne Re-Encoding."""
+    d = probe_duration(path)
+    if d > 0:
+        return d
+    try:
+        res = subprocess.run(["ffmpeg", "-nostdin", "-i", path, "-map", "0:v:0", "-c", "copy", "-f", "null", "-"],
+                             capture_output=True, timeout=120)
+        times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr.decode(errors="ignore"))
+        if times:
+            hh, mm, ss = times[-1]
+            return int(hh) * 3600 + int(mm) * 60 + float(ss)
+    except Exception:
+        pass
+    return 0.0
+
+
+@app.route("/api/archive/clip")
+@admin_required
+def api_archive_clip():
+    """Schneidet ein Ereignis (Start/Ende in Sekunden seit Mitternacht) als MP4-Clip aus den Aufnahmen."""
+    date_str = request.args.get("date", "").strip()
+    cam_id = request.args.get("camera_id", "").strip()
+    try:
+        t0 = max(0.0, float(request.args.get("start", "")))
+        t1 = min(86400.0, float(request.args.get("end", "")))
+    except ValueError:
+        return jsonify({"error": "Ungültige Zeit"}), 400
+    fmt = request.args.get("format", "mp4")
+    inline = request.args.get("inline") == "1"   # Wiedergabe im Browser statt Download (Live-Archiv)
+    cache_file = None
+    if inline and fmt == "mp4":
+        os.makedirs(CLIP_CACHE_DIR, exist_ok=True)
+        for fn in os.listdir(CLIP_CACHE_DIR):   # alte Zwischenspeicher aufraeumen
+            fp = os.path.join(CLIP_CACHE_DIR, fn)
+            try:
+                if time.time() - os.path.getmtime(fp) > 600:
+                    os.remove(fp)
+            except OSError:
+                pass
+        key = hashlib.md5(f"{date_str}|{cam_id}|{int(t0)}|{int(t1)}".encode()).hexdigest()
+        cache_file = os.path.join(CLIP_CACHE_DIR, key + ".mp4")
+        if os.path.isfile(cache_file) and time.time() - os.path.getmtime(cache_file) < 60:
+            return send_file(cache_file, mimetype="video/mp4", conditional=True)
+    if fmt == "gif":
+        t1 = min(t1, t0 + 30)   # GIFs auf 30 Sekunden begrenzen
+    if not DATE_RE.match(date_str) or not cam_id or t1 - t0 < 1 or t1 - t0 > 3600:
+        return jsonify({"error": "Ungültige Anfrage"}), 400
+
+    # Auch laufende ("recording") und gerade konvertierte ("processing") Aufnahmen verwenden -> Live-Suche
+    recs = list_recordings(date_str, cam_id, t0, t1)
+    if not recs:
+        return jsonify({"error": "Keine Aufnahme für diesen Zeitraum"}), 404
+
+    work = tempfile.mkdtemp(prefix="clip_")
+    after_this_request(lambda r: (shutil.rmtree(work, ignore_errors=True), r)[1])
+    parts = []
+    with CLIP_SEM:
+        for i, r in enumerate(recs):
+            path = os.path.join(RECORDINGS_DIR, date_str, r["dir"], r["filename"])
+            if not os.path.isfile(path) and r["filename"].endswith(".rec.mp4"):
+                # Konvertierung war inzwischen fertig -> finale Datei verwenden
+                path = os.path.join(RECORDINGS_DIR, date_str, r["dir"], r["filename"][:-len(".rec.mp4")] + ".mp4")
+            live = r["status"] == "recording"
+            wall = max(1.0, r["end_sec"] - r["start_sec"])
+            dur = probe_live_duration(path) if live else probe_duration(path)
+            scale = (dur / wall) if dur > 0 else 1.0   # Videodauer kann von der Echtzeit abweichen
+            a = max(0.0, t0 - r["start_sec"]) * scale
+            b = min(wall, t1 - r["start_sec"]) * scale
+            if live and dur > 0:
+                b = min(b, dur)   # nicht ueber das bisher geschriebene Ende hinaus
+            if b - a < 0.5:
+                continue
+            out = os.path.join(work, f"p{i}.mp4")
+            res = subprocess.run(
+                ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-ss", f"{a:.3f}", "-i", path, "-t", f"{b - a:.3f}",
+                 "-c:v", "libx264", "-preset", "ultrafast" if inline else "veryfast", "-crf", "26", "-pix_fmt", "yuv420p", "-an",
+                 "-movflags", "+faststart", out], capture_output=True, timeout=600)
+            if res.returncode == 0 and os.path.isfile(out):
+                parts.append(out)
+        if not parts:
+            return jsonify({"error": "Clip konnte nicht erstellt werden"}), 500
+        final = parts[0]
+        if len(parts) > 1:
+            lst = os.path.join(work, "list.txt")
+            with open(lst, "w") as f:
+                f.writelines(f"file '{p}'\n" for p in parts)
+            final = os.path.join(work, "clip.mp4")
+            res = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+                                  "-i", lst, "-c", "copy", "-movflags", "+faststart", final], capture_output=True, timeout=600)
+            if res.returncode != 0:
+                final = parts[0]
+    h, m, sec = int(t0 // 3600), int(t0 % 3600 // 60), int(t0 % 60)
+    name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', recs[0]['camera_name'])}_{date_str}_{h:02d}{m:02d}{sec:02d}.mp4"
+    if fmt == "gif":
+        gif = os.path.join(work, "clip.gif")
+        res = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", final, "-vf",
+                              "fps=8,scale=480:-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse",
+                              "-loop", "0", gif], capture_output=True, timeout=600)
+        if res.returncode != 0 or not os.path.isfile(gif):
+            return jsonify({"error": "GIF konnte nicht erstellt werden"}), 500
+        return send_file(gif, mimetype="image/gif", as_attachment=True, download_name=name[:-4] + ".gif")
+    if cache_file:   # kurz zwischenspeichern: der Browser fragt fuer Vor-/Zurueckspulen mehrfach an
+        tmp = cache_file + f".{uuid.uuid4().hex[:6]}.tmp"
+        shutil.copyfile(final, tmp)
+        os.replace(tmp, cache_file)
+        return send_file(cache_file, mimetype="video/mp4", conditional=True)
+    return send_file(final, mimetype="video/mp4", as_attachment=True, download_name=name)
+
+
+@app.route("/api/archive/snapshot/<date_str>/<filename>")
+@admin_required
+def api_archive_snapshot(date_str, filename):
+    if not DATE_RE.match(date_str) or not re.match(r"^[A-Za-z0-9_.-]+\.jpg$", filename):
+        abort(404)
+    path = os.path.join(RECORDINGS_DIR, date_str, "snapshots", filename)
+    if not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="image/jpeg", max_age=3600)
 
 
 @app.route("/api/archive/video/<date_str>/<filename>")
@@ -1203,8 +1943,8 @@ def api_archive_list():
 def api_archive_video(date_str, filename):
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str) or "/" in filename or "\\" in filename:
         abort(400)
-    fpath = os.path.join(RECORDINGS_DIR, date_str, filename)
-    if not os.path.isfile(fpath):
+    fpath = find_rec_file(date_str, filename)
+    if not fpath:
         abort(404)
     dl = request.args.get("download") == "1"
     return send_file(fpath, mimetype="video/mp4", as_attachment=dl, download_name=filename)
@@ -1215,8 +1955,8 @@ def api_archive_video(date_str, filename):
 def api_archive_delete(date_str, filename):
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str) or "/" in filename or "\\" in filename:
         abort(400)
-    fpath = os.path.join(RECORDINGS_DIR, date_str, filename)
-    if os.path.isfile(fpath):
+    fpath = find_rec_file(date_str, filename)
+    if fpath:
         os.remove(fpath)
     return jsonify({"status": "ok"})
 
@@ -1236,23 +1976,14 @@ def api_archive_export_zip():
     if not os.path.isdir(target_dir):
         return jsonify({"error": "Ordner nicht gefunden"}), 404
 
-    mem_zip = io.BytesIO()
+    t_from = parse_clock(time_from, 0)
+    t_to = parse_clock(time_to, 86400, is_end=True)
+    mem_zip = tempfile.TemporaryFile()
     with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
-        for fname in sorted(os.listdir(target_dir)):
-            if not fname.endswith(".mp4"):
-                continue
-            parts = fname[:-4].split("__")
-            cid = parts[0] if len(parts) > 0 else ""
-            t_raw = parts[2] if len(parts) > 2 else "00-00-00"
-            hh_mm = t_raw[:5].replace("-", ":")
-
-            if cam_filter and cid != cam_filter:
-                continue
-            if not (time_from <= hh_mm <= time_to):
-                continue
-
-            fpath = os.path.join(target_dir, fname)
-            zf.write(fpath, arcname=f"{date_filter}/{fname}")
+        for rec in list_recordings(date_filter, cam_filter, t_from, t_to):
+            if rec["status"] == "ready":
+                zf.write(os.path.join(target_dir, rec["dir"], rec["filename"]),
+                         arcname="/".join(x for x in (date_filter, rec["dir"], rec["filename"]) if x))
 
     mem_zip.seek(0)
     zip_name = f"OpenCam_Archive_{date_filter}_{time_from.replace(':','')}-{time_to.replace(':','')}.zip"

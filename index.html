@@ -142,10 +142,9 @@
             display: flex;
             flex-direction: column;
             width: 560px;
-            height: 370px;
+            max-width: 100%;
             min-width: 300px;
-            min-height: 220px;
-            resize: both;
+            resize: horizontal;
             position: relative;
             box-shadow: 0 8px 20px rgba(0,0,0,0.3);
         }
@@ -175,8 +174,22 @@
         .mode-motion { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid var(--warning); }
         .mode-247 { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid var(--success); }
 
+        .cam-title .dot { width: 9px; height: 9px; border-radius: 50%; background: #6b7280; flex: none; }
+        .cam-title .dot.online { background: var(--success); box-shadow: 0 0 6px var(--success); }
+        .cam-title .dot.offline { background: var(--danger); }
+        .rec-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #ff4d4f; margin-right: 5px; animation: recPulse 1.4s infinite; }
+        @keyframes recPulse { 50% { opacity: 0.25; } }
+        .motion-chip { font-size: 0.7rem; padding: 2px 7px; border-radius: 4px; background: rgba(239,68,68,0.2); color: #fca5a5; border: 1px solid var(--danger); white-space: nowrap; }
+        .cam-actions { display: flex; align-items: center; gap: 6px; }
+        .ptz-overlay { position: absolute; right: 10px; top: 42%; transform: translateY(-50%); z-index: 4; display: grid; grid-template-columns: repeat(3, 30px); grid-template-rows: repeat(3, 30px); gap: 3px; opacity: 0; transition: opacity 0.15s; }
+        .cam-viewport:hover .ptz-overlay { opacity: 1; }
+        .ptz-overlay button { background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.25); color: #fff; border-radius: 6px; cursor: pointer; }
+        .ptz-overlay button:hover { background: rgba(255,255,255,0.25); }
+        .camera-grid.cols .cam-tile { width: calc((100% - (var(--cols) - 1) * var(--grid-gap, 16px)) / var(--cols)); resize: none; }
         .cam-viewport {
-            flex: 1;
+            flex: none;
+            width: 100%;
+            aspect-ratio: 16 / 9;
             background: #050608;
             position: relative;
             overflow: hidden;
@@ -266,6 +279,69 @@
             color: var(--muted);
             font-weight: 600;
         }
+
+        /* Archive Player & Timeline */
+        .tl-toolbar { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; margin-bottom: 12px; font-size: 0.78rem; color: var(--muted); }
+        .cam-playback { background: #000; }
+        .cam-viewport { position: relative; }
+        /* Player-Overlay (YouTube-Stil): dünne Leiste immer sichtbar, Bedienung beim Darüberfahren */
+        .pl-bar { position: absolute; left: 0; right: 0; bottom: 0; z-index: 5; padding: 30px 12px 8px; background: linear-gradient(to top, rgba(0,0,0,0.8), rgba(0,0,0,0)); }
+        .pl-controls { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; opacity: 0; transition: opacity 0.15s; }
+        .cam-viewport:hover .pl-controls, .pl-bar.active .pl-controls { opacity: 1; }
+        .pl-spacer { flex: 1; }
+        .pl-btn { background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.25); color: #fff; border-radius: 6px; padding: 2px 9px; font-size: 0.78rem; cursor: pointer; }
+        .pl-btn:hover { background: rgba(255,255,255,0.22); }
+        .pl-btn.pl-live { color: #d1d5db; }
+        .pl-btn.pl-live.is-live { color: #ff4d4f; border-color: rgba(255,77,79,0.6); }
+        .pl-bar .tl-time { color: #fff; text-shadow: 0 1px 3px #000; }
+        .pl-bar .tl-area { cursor: pointer; }
+        .pl-bar .tl-axis { height: 14px; opacity: 0; transition: opacity 0.15s; }
+        .pl-bar .tl-tick { color: #e5e7eb; text-shadow: 0 1px 2px #000; }
+        .pl-bar .tl-tick::after { display: none; }
+        .cam-viewport:hover .pl-bar .tl-axis, .pl-bar.active .tl-axis { opacity: 1; }
+        .pl-bar .tl-lane { height: 5px; border: 0; border-radius: 3px; overflow: hidden; background: rgba(255,255,255,0.28); transition: height 0.1s; }
+        .pl-bar .tl-area:hover .tl-lane, .pl-bar.active .tl-lane { height: 12px; }
+        .pl-bar .tl-rec { top: 0; bottom: 0; height: auto; border-radius: 0; opacity: 0.75; }
+        .pl-bar .tl-evt { top: 0; bottom: 0; height: auto; border-radius: 0; }
+        .pl-bar .tl-cursor { top: 14px; bottom: 0; width: 3px; margin-left: -1.5px; border-radius: 2px; background: #fff; box-shadow: none; }
+        .pl-bar .tl-cursor.live { background: #ff4d4f; }
+        .pl-bar .tl-now { top: 14px; }
+        .pl-tip { position: absolute; top: -2px; transform: translate(-50%, -100%); background: rgba(0,0,0,0.85); color: #fff; font-size: 0.75rem; padding: 2px 6px; border-radius: 4px; pointer-events: none; white-space: nowrap; }
+        .storage-line { font-size: 0.8rem; color: var(--muted); margin: 0 0 12px; }
+        .storage-bar { height: 5px; border-radius: 3px; background: var(--border); margin-top: 5px; overflow: hidden; }
+        .storage-bar > div { height: 100%; background: var(--accent); }
+        .event-wall { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+        .wall-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+        .wall-thumb { position: relative; aspect-ratio: 16 / 9; background: #000; cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+        .wall-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .wall-dur { position: absolute; right: 6px; bottom: 6px; background: rgba(0,0,0,0.75); color: #fff; font-size: 0.72rem; padding: 1px 6px; border-radius: 4px; }
+        .wall-meta { padding: 8px 10px 2px; font-size: 0.82rem; }
+        .wall-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 10px 10px; }
+        .tl-chips { display: flex; gap: 6px; }
+        .tl-chip { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: 3px 12px; font-size: 0.78rem; cursor: pointer; }
+        .tl-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+        .ev-badge { display: inline-flex; align-items: center; gap: 7px; }
+        .ev-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+        .tl-time { font-variant-numeric: tabular-nums; font-size: 0.85rem; color: var(--text); min-width: 7ch; }
+        .tl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-left: auto; }
+        .tl-key { display: inline-flex; align-items: center; gap: 6px; }
+        .tl-key i { width: 12px; height: 8px; border-radius: 2px; display: inline-block; }
+        .tl-area { position: relative; cursor: col-resize; touch-action: none; user-select: none; }
+        .tl-axis { position: relative; height: 22px; }
+        .tl-tick { position: absolute; top: 0; transform: translateX(-50%); font-size: 0.7rem; color: var(--muted); }
+        .tl-tick::after { content: ""; position: absolute; left: 50%; top: 15px; height: 6px; width: 1px; background: var(--border); }
+        .tl-lane { position: relative; box-sizing: border-box; height: 30px; background: #101318; border-top: 1px solid var(--border); }
+        .tl-rec { position: absolute; bottom: 3px; height: 14px; border-radius: 3px; min-width: 2px; }
+        .tl-rec247 { background: var(--accent); }
+        .tl-motionrec { background: var(--warning); }
+        .tl-recording { background-image: repeating-linear-gradient(45deg, rgba(0,0,0,0.35) 0 5px, transparent 5px 10px); }
+        .tl-processing { opacity: 0.45; }
+        .tl-evt { position: absolute; top: 3px; height: 8px; border-radius: 2px; min-width: 2px; }
+        .tl-evt-motion { background: var(--danger); }
+        .tl-evt-offline { background: #6b7280; }
+        .tl-cursor { position: absolute; top: 22px; bottom: 0; width: 2px; margin-left: -1px; background: #fff; box-shadow: 0 0 6px rgba(255,255,255,0.7); pointer-events: none; }
+        .tl-now { position: absolute; top: 22px; bottom: 0; width: 1px; background: rgba(255,255,255,0.28); pointer-events: none; }
+        .tl-empty { color: var(--muted); font-size: 0.82rem; padding: 6px 0; }
 
         /* Modals */
         .modal-backdrop {
@@ -381,6 +457,17 @@
 <main>
     <!-- LIVE GRID VIEW -->
     <section id="viewLive">
+        <div class="tl-toolbar" id="tlToolbar">
+            <div id="tlAdminTools" style="display:none; align-items:center; flex-wrap:wrap; gap:6px 16px;">
+            <select class="input-ctrl" id="tlDate" onchange="loadTimeline()"></select>
+            <div class="tl-chips"><button class="tl-chip" id="tlWin1" onclick="setTlWindow(1)">1h</button><button class="tl-chip active" id="tlWin6" onclick="setTlWindow(6)">6h</button><button class="tl-chip" id="tlWin0" onclick="setTlWindow(0)">24h</button></div>
+            <div class="tl-legend" style="margin-left:0;"><span class="tl-key"><i style="background:var(--accent)"></i><span data-tl="rec247"></span></span><span class="tl-key"><i style="background:var(--warning)"></i><span data-tl="recMotion"></span></span><span class="tl-key"><i style="background:var(--danger)"></i><span data-tl="evtMotion"></span></span><span class="tl-key"><i style="background:#6b7280"></i><span data-tl="evtOffline"></span></span></div>
+            </div>
+            <label style="margin-left:auto;">Spalten / Columns</label>
+            <select class="input-ctrl" id="gridCols" onchange="applyGridCols()">
+                <option value="0">Auto</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
+            </select>
+        </div>
         <div class="camera-grid" id="cameraGrid"></div>
     </section>
 
@@ -393,22 +480,47 @@
             </div>
             <div class="field-col">
                 <label data-i18n="lbl_from">From (HH:MM)</label>
-                <input type="time" class="input-ctrl" id="archFrom" value="00:00">
+                <input type="time" class="input-ctrl" id="archFrom" value="00:00" onchange="loadArchive()">
             </div>
             <div class="field-col">
                 <label data-i18n="lbl_to">To (HH:MM)</label>
-                <input type="time" class="input-ctrl" id="archTo" value="23:59">
+                <input type="time" class="input-ctrl" id="archTo" value="23:59" onchange="loadArchive()">
             </div>
             <div class="field-col">
                 <label data-i18n="lbl_camera">Camera</label>
-                <select class="input-ctrl" id="archCamSelect">
+                <select class="input-ctrl" id="archCamSelect" onchange="loadArchive()">
                     <option value="">All</option>
+                </select>
+            </div>
+            <div class="field-col">
+                <label>Ansicht / View</label>
+                <select class="input-ctrl" id="archView" onchange="renderArchive()">
+                    <option value="events">Ereignisse / Events</option>
+                    <option value="gallery">Galerie / Gallery</option>
+                    <option value="recs">Aufnahmen / Recordings</option>
+                </select>
+            </div>
+            <div class="field-col" id="archEvTypeCol">
+                <label>Ereignis / Event</label>
+                <select class="input-ctrl" id="archEvType" onchange="renderArchive()">
+                    <option value="">Alle / All</option>
+                    <option value="motion">Bewegung / Motion</option>
+                    <option value="offline">Kamera offline / Camera offline</option>
                 </select>
             </div>
             <button class="btn btn-primary" onclick="loadArchive()" data-i18n="btn_filter">Filter</button>
             <button class="btn" onclick="exportArchiveZip()" data-i18n="btn_export_zip">ZIP Export</button>
         </div>
 
+        <div class="storage-line" id="archStorage"></div>
+        <div id="archEventsWrap">
+            <table class="archive-table">
+                <thead><tr><th>Zeit / Time</th><th>Kamera / Camera</th><th>Ereignis / Event</th><th>Dauer / Duration</th><th>Aktionen / Actions</th></tr></thead>
+                <tbody id="archEventBody"></tbody>
+            </table>
+        </div>
+        <div id="archGalleryWrap" class="hidden"><div class="event-wall" id="archGallery"></div></div>
+        <div id="archRecsWrap" class="hidden">
         <table class="archive-table">
             <thead>
                 <tr>
@@ -422,6 +534,7 @@
             </thead>
             <tbody id="archiveTableBody"></tbody>
         </table>
+        </div>
     </section>
 </main>
 
@@ -588,18 +701,26 @@
             <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px;">
                 <button class="btn btn-primary" id="btnDrawPrivacy" onclick="setZoneDrawType('privacy')" data-i18n="btn_privacy_zone">Draw Privacy Zone (Blackout)</button>
                 <button class="btn" id="btnDrawMotion" onclick="setZoneDrawType('motion')" data-i18n="btn_motion_zone">Draw Motion Zone</button>
+                <button class="btn" onclick="undoZone()">↶ Undo</button>
                 <button class="btn btn-danger" onclick="clearCurrentZones()" data-i18n="btn_clear_zones">Clear Zones</button>
                 <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
                     <label data-i18n="lbl_sensitivity">Sensitivity</label>
                     <input type="range" id="zoneSensSlider" min="1" max="100" value="50">
+                    <span id="zoneSensVal" style="min-width:2ch; color:var(--muted);">50</span>
                 </div>
             </div>
             <div class="zone-canvas-wrap">
                 <img id="zonePreviewImg" src="" alt="Zone Feed">
                 <canvas id="zoneCanvas"></canvas>
             </div>
-            <div style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
-                <button class="btn btn-primary" onclick="saveZonesToServer()" data-i18n="btn_save">Save</button>
+            <div style="margin-top:10px; font-size:0.8rem; color:var(--muted); line-height:1.5;">
+                Rechteck aufziehen · Rechtsklick (Touch: lang drücken) löscht eine Zone. <b>Schwarz</b> = Privatzone (in Bild und Aufnahme geschwärzt). <b>Grün</b> = Bewegungszone: Nur dort wird Bewegung erkannt, ohne grüne Zone das ganze Bild.<br>
+                Draw a rectangle · right-click (touch: long-press) deletes a zone. Black = privacy zone, green = motion zone (none = whole image).
+            </div>
+            <div style="margin-top:14px; display:flex; justify-content:flex-end; align-items:center; gap:10px;">
+                <span class="motion-chip" id="zoneMotion" style="opacity:0.3; margin-right:auto;">⚡ Bewegung / Motion</span>
+                <button class="btn" onclick="saveZonesToServer(false)">Anwenden / Apply</button>
+                <button class="btn btn-primary" onclick="saveZonesToServer(true)" data-i18n="btn_save">Save</button>
             </div>
         </div>
     </div>
@@ -838,6 +959,8 @@ async function initApp() {
     applyTranslations();
     renderLiveGrid();
     populateArchiveCameraSelect();
+    document.getElementById("tlAdminTools").style.display = appState.role === "admin" ? "flex" : "none";
+    loadTimeline();
 }
 
 function applyTranslations() {
@@ -867,6 +990,7 @@ function switchMainTab(tab) {
     document.getElementById("tabBtnLive").classList.toggle("active", tab === "live");
     document.getElementById("tabBtnArchive").classList.toggle("active", tab === "archive");
     if (tab === "archive") loadArchive();
+    if (tab === "live") loadTimeline();
 }
 
 /* ============================================================================
@@ -887,48 +1011,70 @@ function renderLiveGrid() {
         tile.className = "cam-tile";
         if (savedSizes[cam.id]) {
             tile.style.width = savedSizes[cam.id].w;
-            tile.style.height = savedSizes[cam.id].h;
         }
 
         const modeClass = cam.recording_mode === "24/7" ? "mode-247" : (cam.recording_mode === "motion" ? "mode-motion" : "mode-live");
         const modeLabel = cam.recording_mode === "24/7" ? "24/7 REC" : (cam.recording_mode === "motion" ? "MOTION" : "LIVE");
 
-        let adminControls = "";
-        if (appState.role === "admin") {
-            adminControls = `
-                <div class="ptz-pad">
-                    <button class="ptz-btn" onclick="sendPtz('${cam.id}','left')">◀</button>
-                    <button class="ptz-btn" onclick="sendPtz('${cam.id}','up')">▲</button>
-                    <button class="ptz-btn" onclick="sendPtz('${cam.id}','down')">▼</button>
-                    <button class="ptz-btn" onclick="sendPtz('${cam.id}','right')">▶</button>
-                </div>
-                <select class="input-ctrl" style="padding:3px 6px; font-size:0.78rem;" onchange="quickChangeMode('${cam.id}', this.value)">
-                    <option value="live" ${cam.recording_mode === "live" ? "selected" : ""}>Live</option>
-                    <option value="motion" ${cam.recording_mode === "motion" ? "selected" : ""}>Motion</option>
-                    <option value="24/7" ${cam.recording_mode === "24/7" ? "selected" : ""}>24/7</option>
-                </select>
-                <button class="ptz-btn" onclick="openZoneModal('${cam.id}')">Zones</button>
-            `;
-        }
+        const adminActions = appState.role !== "admin" ? "" : `
+            <select class="input-ctrl" style="padding:3px 6px; font-size:0.78rem;" onchange="quickChangeMode('${cam.id}', this.value)">
+                <option value="live" ${cam.recording_mode === "live" ? "selected" : ""}>Live</option>
+                <option value="motion" ${cam.recording_mode === "motion" ? "selected" : ""}>Motion</option>
+                <option value="24/7" ${cam.recording_mode === "24/7" ? "selected" : ""}>24/7</option>
+            </select>
+            <button class="ptz-btn" onclick="openZoneModal('${cam.id}')" title="Zones">▦ Zones</button>`;
+        const ptzHtml = (appState.role !== "admin" || cam.ptz_enabled === false) ? "" : `
+                <div class="ptz-overlay">
+                    <button style="grid-area:1/2" onclick="sendPtz('${cam.id}','up')">▲</button>
+                    <button style="grid-area:2/1" onclick="sendPtz('${cam.id}','left')">◀</button>
+                    <button style="grid-area:2/3" onclick="sendPtz('${cam.id}','right')">▶</button>
+                    <button style="grid-area:3/2" onclick="sendPtz('${cam.id}','down')">▼</button>
+                </div>`;
+
+        const overlayHtml = appState.role !== "admin" ? "" : `
+                <div class="pl-bar">
+                    <div class="pl-controls">
+                        <button class="pl-btn" onclick="jumpEvent('${cam.id}', -1)" title="Previous event">⏮</button>
+                        <button class="pl-btn" onclick="jumpEvent('${cam.id}', 1)" title="Next event">⏭</button>
+                        <button class="pl-btn hidden" id="plPlay_${cam.id}" onclick="plTogglePlay('${cam.id}')">⏸</button>
+                        <button class="pl-btn pl-live is-live" id="tlLive_${cam.id}" onclick="backToLive('${cam.id}')">● LIVE</button>
+                        <span class="tl-time" id="tlTime_${cam.id}"></span>
+                        <span class="pl-spacer"></span>
+                        <button class="pl-btn hidden" id="plSpeed_${cam.id}" onclick="plCycleSpeed('${cam.id}')">1×</button>
+                        <button class="pl-btn" onclick="plFullscreen('${cam.id}')" title="Fullscreen">⛶</button>
+                    </div>
+                    <div class="tl-area" id="tlArea_${cam.id}">
+                        <div class="tl-axis" id="tlAxis_${cam.id}"></div>
+                        <div class="tl-lane" id="tlLane_${cam.id}"></div>
+                        <div class="tl-now hidden" id="tlNow_${cam.id}"></div>
+                        <div class="tl-cursor live hidden" id="tlCur_${cam.id}"></div>
+                        <div class="pl-tip hidden" id="tlTip_${cam.id}"></div>
+                    </div>
+                </div>`;
 
         tile.innerHTML = `
             <div class="cam-header">
                 <div class="cam-title">
+                    <span class="dot ${cam.online ? "online" : "offline"}" id="dot_${cam.id}"></span>
                     <span>${cam.name}</span>
-                    <span class="status-pill ${modeClass}">${modeLabel}</span>
+                    <span class="status-pill ${modeClass}"><i class="rec-dot hidden" id="rec_${cam.id}"></i>${modeLabel}</span>
+                    <span class="motion-chip hidden" id="mot_${cam.id}">⚡ ${tlt("evtMotion")}</span>
                 </div>
-                <a class="ptz-btn" href="/api/snapshot/${cam.id}" style="text-decoration:none;">📷 Snapshot</a>
+                <div class="cam-actions">
+                    ${adminActions}
+                    <a class="ptz-btn" href="/api/snapshot/${cam.id}" style="text-decoration:none;" title="Snapshot">📷</a>
+                </div>
             </div>
             <div class="cam-viewport" id="vp_${cam.id}">
                 <img class="cam-stream" id="img_${cam.id}" src="/api/stream/${cam.id}" alt="${cam.name}">
-            </div>
-            <div class="cam-controls">
-                ${adminControls}
+                <video class="cam-stream cam-playback hidden" id="vid_${cam.id}" preload="metadata" playsinline></video>
+                ${ptzHtml}
+                ${overlayHtml}
             </div>
         `;
 
         const ro = new ResizeObserver(() => {
-            if (tile.offsetWidth > 200 && tile.offsetHeight > 150) {
+            if (tile.offsetWidth > 200 && tile.offsetHeight > 150 && !grid.classList.contains("cols")) {
                 const cur = JSON.parse(localStorage.getItem("opencam_tile_sizes") || "{}");
                 cur[cam.id] = { w: tile.style.width || `${tile.offsetWidth}px`, h: tile.style.height || `${tile.offsetHeight}px` };
                 localStorage.setItem("opencam_tile_sizes", JSON.stringify(cur));
@@ -937,9 +1083,57 @@ function renderLiveGrid() {
         ro.observe(tile);
 
         grid.appendChild(tile);
+        if (appState.role === "admin") { initTileTimeline(cam.id); renderTileTimeline(cam.id); }
         attachZoomPan(document.getElementById(`vp_${cam.id}`), document.getElementById(`img_${cam.id}`));
+        document.getElementById(`img_${cam.id}`).addEventListener("load", syncTileAspect);
+    });
+    document.getElementById("gridCols").value = localStorage.getItem("opencam_cols") || "0";
+    applyGridCols();
+    pollLiveStatus();
+}
+
+function applyGridCols() {
+    const n = parseInt(document.getElementById("gridCols").value, 10) || 0;
+    localStorage.setItem("opencam_cols", n);
+    const grid = document.getElementById("cameraGrid");
+    const gap = getComputedStyle(grid).columnGap;
+    grid.classList.toggle("cols", n > 0);
+    grid.style.setProperty("--cols", n || 1);
+    grid.style.setProperty("--grid-gap", gap && gap !== "normal" ? gap : "16px");
+    setTimeout(() => appState.cameras.forEach(c => renderTileTimeline(c.id)), 60);
+}
+
+async function pollLiveStatus() {   // Verbindung, Aufnahme und Bewegung der Kacheln aktuell halten
+    if (document.hidden) return;
+    try {
+        const res = await fetch("/api/live-status");
+        if (!res.ok) return;
+        const st = await res.json();
+        appState.liveStatus = st;
+        appState.cameras.forEach(c => {
+            const dot = document.getElementById(`dot_${c.id}`);
+            if (!dot) return;
+            const v = st[c.id] || {};
+            dot.className = "dot " + (v.online ? "online" : "offline");
+            document.getElementById(`rec_${c.id}`).classList.toggle("hidden", !v.recording);
+            document.getElementById(`mot_${c.id}`).classList.toggle("hidden", !v.motion);
+        });
+    } catch (e) { /* naechster Versuch in 3 s */ }
+}
+setInterval(pollLiveStatus, 3000);
+
+function syncTileAspect() {
+    document.querySelectorAll(".cam-viewport").forEach(vp => {
+        const img = vp.querySelector("img.cam-stream");
+        if (!img || !img.naturalWidth) return;
+        const ar = `${img.naturalWidth} / ${img.naturalHeight}`;
+        if (vp.dataset.ar !== ar) {
+            vp.dataset.ar = ar;
+            vp.style.aspectRatio = ar;
+        }
     });
 }
+setInterval(syncTileAspect, 1500);
 
 function attachZoomPan(viewport, img) {
     let scale = 1, panX = 0, panY = 0, isDragging = false, startX = 0, startY = 0;
@@ -1208,7 +1402,7 @@ async function deleteUser(username) {
 /* ============================================================================
    VISUAL ZONE EDITOR (PRIVACY BLACKOUT & MOTION ZONES)
    ============================================================================ */
-let isDrawingZone = false, zStartX = 0, zStartY = 0;
+let zoneDrag = null, zoneObserver = null, zoneMotionTimer = null, zoneHistory = [];
 
 function openZoneModal(camId) {
     const cam = appState.cameras.find(c => c.id === camId);
@@ -1216,15 +1410,32 @@ function openZoneModal(camId) {
     appState.zoneEditorCam = cam;
     appState.privacyZones = JSON.parse(JSON.stringify(cam.privacy_zones || []));
     appState.motionZones = JSON.parse(JSON.stringify(cam.motion_zones || []));
-    document.getElementById("zoneSensSlider").value = cam.motion_sensitivity || 50;
+    zoneHistory = [...appState.privacyZones.map(() => "privacy"), ...appState.motionZones.map(() => "motion")];
+    const slider = document.getElementById("zoneSensSlider");
+    slider.value = cam.motion_sensitivity || 50;
+    document.getElementById("zoneSensVal").textContent = slider.value;
+    slider.oninput = () => { document.getElementById("zoneSensVal").textContent = slider.value; };
+    document.getElementById("zoneModalTitle").textContent = `Zones · ${cam.name}`;
     document.getElementById("zonePreviewImg").src = `/api/stream/${cam.id}`;
     document.getElementById("zoneModal").classList.remove("hidden");
     setTimeout(initZoneCanvas, 200);
+    // Live-Anzeige: so sieht man sofort, ob die Empfindlichkeit/Zone passt (nach "Anwenden")
+    clearInterval(zoneMotionTimer);
+    zoneMotionTimer = setInterval(async () => {
+        try {
+            const res = await fetch("/api/live-status");
+            if (!res.ok) return;
+            const v = (await res.json())[cam.id] || {};
+            document.getElementById("zoneMotion").style.opacity = v.motion ? "1" : "0.3";
+        } catch (e) { /* ignorieren */ }
+    }, 700);
 }
 
 function closeZoneModal() {
     document.getElementById("zoneModal").classList.add("hidden");
     document.getElementById("zonePreviewImg").src = "";
+    clearInterval(zoneMotionTimer);
+    if (zoneObserver) zoneObserver.disconnect();
 }
 
 function setZoneDrawType(type) {
@@ -1236,67 +1447,106 @@ function setZoneDrawType(type) {
 function clearCurrentZones() {
     appState.privacyZones = [];
     appState.motionZones = [];
+    zoneHistory = [];
+    drawZonesCanvas();
+}
+
+function undoZone() {
+    while (zoneHistory.length) {
+        const list = zoneHistory.pop() === "privacy" ? appState.privacyZones : appState.motionZones;
+        if (list.length) { list.pop(); break; }
+    }
+    drawZonesCanvas();
+}
+
+function removeZoneAt(p) {   // Rechtsklick / langes Druecken: oberste Zone unter dem Zeiger loeschen
+    const hit = z => p.x >= z.x && p.x <= z.x + z.w && p.y >= z.y && p.y <= z.y + z.h;
+    for (const list of [appState.motionZones, appState.privacyZones]) {
+        const i = list.map(hit).lastIndexOf(true);
+        if (i >= 0) { list.splice(i, 1); break; }
+    }
     drawZonesCanvas();
 }
 
 function initZoneCanvas() {
     const canvas = document.getElementById("zoneCanvas");
     const img = document.getElementById("zonePreviewImg");
-    canvas.width = img.clientWidth || 640;
-    canvas.height = img.clientHeight || 360;
-    drawZonesCanvas();
-
-    canvas.onmousedown = e => {
-        const rect = canvas.getBoundingClientRect();
-        zStartX = (e.clientX - rect.left) / canvas.width;
-        zStartY = (e.clientY - rect.top) / canvas.height;
-        isDrawingZone = true;
+    // Zeichenflaeche immer auf die tatsaechlich angezeigte Bildgroesse bringen (auch nach Laden/Resize)
+    const sync = () => {
+        const w = img.clientWidth, h = img.clientHeight;
+        if (w && h && (canvas.width !== w || canvas.height !== h)) { canvas.width = w; canvas.height = h; }
+        drawZonesCanvas();
     };
+    sync();
+    img.onload = sync;
+    if (zoneObserver) zoneObserver.disconnect();
+    zoneObserver = new ResizeObserver(sync);
+    zoneObserver.observe(img);
 
-    canvas.onmouseup = e => {
-        if (!isDrawingZone) return;
-        isDrawingZone = false;
-        const rect = canvas.getBoundingClientRect();
-        const endX = (e.clientX - rect.left) / canvas.width;
-        const endY = (e.clientY - rect.top) / canvas.height;
-        const zone = {
-            x: Math.min(zStartX, endX),
-            y: Math.min(zStartY, endY),
-            w: Math.abs(endX - zStartX),
-            h: Math.abs(endY - zStartY)
-        };
-        if (zone.w > 0.02 && zone.h > 0.02) {
-            if (appState.zoneDrawType === "privacy") appState.privacyZones.push(zone);
-            else appState.motionZones.push(zone);
+    const pos = e => {   // relativ zur angezeigten Groesse (0..1), unabhaengig von der Canvas-Pixelgroesse
+        const r = canvas.getBoundingClientRect();
+        return {x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))};
+    };
+    canvas.style.touchAction = "none";
+    canvas.onpointerdown = e => {
+        if (e.button !== 0) return;
+        canvas.setPointerCapture(e.pointerId);
+        zoneDrag = {a: pos(e), b: pos(e)};
+    };
+    canvas.onpointermove = e => {
+        if (!zoneDrag) return;
+        zoneDrag.b = pos(e);
+        drawZonesCanvas();
+    };
+    canvas.onpointerup = e => {
+        if (!zoneDrag) return;
+        zoneDrag.b = pos(e);
+        const z = zoneRect(zoneDrag);
+        zoneDrag = null;
+        if (z.w > 0.02 && z.h > 0.02) {
+            (appState.zoneDrawType === "privacy" ? appState.privacyZones : appState.motionZones).push(z);
+            zoneHistory.push(appState.zoneDrawType);
         }
         drawZonesCanvas();
     };
+    canvas.onpointercancel = () => { zoneDrag = null; drawZonesCanvas(); };
+    canvas.oncontextmenu = e => { e.preventDefault(); removeZoneAt(pos(e)); };
+}
+
+function zoneRect(d) {
+    return {x: Math.min(d.a.x, d.b.x), y: Math.min(d.a.y, d.b.y), w: Math.abs(d.b.x - d.a.x), h: Math.abs(d.b.y - d.a.y)};
 }
 
 function drawZonesCanvas() {
     const canvas = document.getElementById("zoneCanvas");
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
-    ctx.strokeStyle = "#ef4444";
-    ctx.lineWidth = 2;
-    appState.privacyZones.forEach(z => {
-        ctx.fillRect(z.x * canvas.width, z.y * canvas.height, z.w * canvas.width, z.h * canvas.height);
-        ctx.strokeRect(z.x * canvas.width, z.y * canvas.height, z.w * canvas.width, z.h * canvas.height);
-    });
-
-    ctx.fillStyle = "rgba(16, 185, 129, 0.25)";
-    ctx.strokeStyle = "#10b981";
-    appState.motionZones.forEach(z => {
-        ctx.fillRect(z.x * canvas.width, z.y * canvas.height, z.w * canvas.width, z.h * canvas.height);
-        ctx.strokeRect(z.x * canvas.width, z.y * canvas.height, z.w * canvas.width, z.h * canvas.height);
-    });
+    const draw = (z, fill, stroke, dash, label) => {
+        const x = z.x * canvas.width, y = z.y * canvas.height, w = z.w * canvas.width, h = z.h * canvas.height;
+        ctx.fillStyle = fill;
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = 2;
+        ctx.setLineDash(dash ? [6, 4] : []);
+        ctx.fillRect(x, y, w, h);
+        ctx.strokeRect(x, y, w, h);
+        if (label) {
+            ctx.setLineDash([]);
+            ctx.fillStyle = stroke;
+            ctx.font = "12px sans-serif";
+            ctx.fillText(label, x + 6, y + 15);
+        }
+    };
+    appState.privacyZones.forEach(z => draw(z, "rgba(0,0,0,0.85)", "#ef4444", false, "Privat / Privacy"));
+    appState.motionZones.forEach(z => draw(z, "rgba(16,185,129,0.25)", "#10b981", false, "Bewegung / Motion"));
+    if (zoneDrag) {   // Vorschau beim Aufziehen
+        const privacy = appState.zoneDrawType === "privacy";
+        draw(zoneRect(zoneDrag), privacy ? "rgba(0,0,0,0.6)" : "rgba(16,185,129,0.2)", privacy ? "#ef4444" : "#10b981", true, "");
+    }
 }
 
-async function saveZonesToServer() {
+async function saveZonesToServer(close = true) {
     if (!appState.zoneEditorCam) return;
-    await fetch(`/api/cameras/${appState.zoneEditorCam.id}/zones`, {
+    const res = await fetch(`/api/cameras/${appState.zoneEditorCam.id}/zones`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
@@ -1305,8 +1555,9 @@ async function saveZonesToServer() {
             motion_sensitivity: parseInt(document.getElementById("zoneSensSlider").value, 10)
         })
     });
+    if (!res.ok) return;
     await initApp();
-    closeZoneModal();
+    if (close) closeZoneModal();
 }
 
 /* ============================================================================
@@ -1320,6 +1571,37 @@ function populateArchiveCameraSelect() {
     });
 }
 
+/* ARCHIV-TABELLE & ZEITLEISTE (eine pro Kamerakachel) */
+const TL_TXT = {
+    de: {rec247: "24/7-Aufnahme", recMotion: "Bewegungsaufnahme", evtMotion: "Bewegung erkannt", evtOffline: "Kamera offline",
+         none: "Keine Aufnahme", noEvents: "Keine Ereignisse für diesen Filter", hint: "Klicken oder ziehen, um in der Aufzeichnung zu suchen", recording: "⏺ Aufnahme läuft", processing: "⏳ Wird konvertiert"},
+    en: {rec247: "24/7 recording", recMotion: "Motion recording", evtMotion: "Motion detected", evtOffline: "Camera offline",
+         none: "No recording", noEvents: "No events for this filter", hint: "Click or drag to seek in the recording", recording: "⏺ Recording", processing: "⏳ Converting"}
+};
+function tlt(k) { return (TL_TXT[appState.lang] || TL_TXT.en)[k]; }
+
+function fmtHMS(sec) {
+    sec = Math.max(0, Math.min(86399, Math.floor(sec)));
+    const p = n => String(n).padStart(2, "0");
+    return `${p(Math.floor(sec / 3600))}:${p(Math.floor((sec % 3600) / 60))}:${p(sec % 60)}`;
+}
+
+let archTableRecs = [], archEvents = [];
+let tlWin = 6;   // Zeitfenster in Stunden (nur heute); 0 = ganzer Tag
+const tlDay = {from: 0, to: 86400, nowSec: null};
+const tlCams = {};   // camId -> {recs, events, cur, cursorSec, dragging, rate}
+function tlCam(id) { return tlCams[id] || (tlCams[id] = {recs: [], events: [], cur: null, cursorSec: null, dragging: false, rate: 1}); }
+function tlPct(sec) { return ((sec - tlDay.from) / (tlDay.to - tlDay.from)) * 100; }
+function camName(id) { const c = appState.cameras.find(x => x.id === id); return c ? c.name : id; }
+function fmtDur(sec) {
+    sec = Math.round(sec);
+    if (sec < 60) return `${sec} s`;
+    if (sec < 3600) return `${Math.floor(sec / 60)} min ${sec % 60} s`;
+    return `${Math.floor(sec / 3600)} h ${Math.floor((sec % 3600) / 60)} min`;
+}
+const EV_COLORS = {motion: "var(--danger)", offline: "#6b7280"};
+
+/* ---------- Archiv: Ereignisse (filtern, abspielen, Clip laden) und Aufnahmen ---------- */
 async function loadArchive() {
     if (appState.role !== "admin") return;
     const dateVal = document.getElementById("archDateSelect").value;
@@ -1341,33 +1623,393 @@ async function loadArchive() {
         if (d === data.selected_date) opt.selected = true;
         dateSelect.appendChild(opt);
     });
+    archTableRecs = data.recordings || [];
+    archEvents = data.events || [];
+    renderArchive();
+    loadStorage();
+}
 
-    const tbody = document.getElementById("archiveTableBody");
+async function loadStorage() {
+    const res = await fetch("/api/status");
+    if (!res.ok) return;
+    const d = await res.json();
+    const gb = b => (b / 1024 ** 3).toFixed(b < 10 * 1024 ** 3 ? 1 : 0) + " GB";
+    const limit = d.max_storage_gb > 0 ? ` · Limit ${d.max_storage_gb} GB` : "";
+    const bk = d.backup && d.backup.enabled
+        ? (d.backup.last_error ? ` · ⚠ Backup: ${d.backup.last_error}` : (d.backup.last_run ? ` · Backup ✓ ${new Date(d.backup.last_run * 1000).toLocaleString()}` : " · Backup wartet")) : "";
+    const pct = Math.min(100, (d.recordings_bytes / d.disk_total) * 100).toFixed(1);
+    document.getElementById("archStorage").innerHTML =
+        `Aufnahmen / Recordings: <b>${gb(d.recordings_bytes)}</b> · Frei / Free: <b>${gb(d.disk_free)}</b> von ${gb(d.disk_total)} · ${d.retention_days} d${limit}${bk}
+         <div class="storage-bar"><div style="width:${pct}%"></div></div>`;
+}
+
+function renderArchive() {
+    const view = document.getElementById("archView").value;
+    document.getElementById("archEventsWrap").classList.toggle("hidden", view !== "events");
+    document.getElementById("archGalleryWrap").classList.toggle("hidden", view !== "gallery");
+    document.getElementById("archRecsWrap").classList.toggle("hidden", view !== "recs");
+    document.getElementById("archEvTypeCol").classList.toggle("hidden", view !== "events");
+    if (view === "events") renderEventTable();
+    else if (view === "gallery") renderGallery();
+    else renderArchiveTable();
+}
+
+function eventActions(date, e) {   // Play, MP4-Clip und GIF (5 s Vor-/Nachlauf)
+    const cs = Math.max(0, e.start - 5);
+    const ce = Math.min(86400, Math.max(e.end, e.start + 3) + 5, cs + 3600);
+    const q = fmt => new URLSearchParams({date: date, camera_id: e.cam_id, start: cs.toFixed(1), end: ce.toFixed(1), format: fmt}).toString();
+    return `<button class="btn btn-primary" onclick="playEvent('${date}','${e.cam_id}',${e.start})">▶ Play</button>
+            <a class="btn" href="/api/archive/clip?${q("mp4")}" style="text-decoration:none;">⬇ MP4</a>
+            <a class="btn" href="/api/archive/clip?${q("gif")}" style="text-decoration:none;">⬇ GIF</a>`;
+}
+
+function renderGallery() {   // Event-Wall: ein Vorschaubild pro Bewegungsereignis
+    const date = document.getElementById("archDateSelect").value;
+    const wall = document.getElementById("archGallery");
+    wall.innerHTML = "";
+    const list = archEvents.filter(e => e.type === "motion").sort((a, b) => b.start - a.start);
+    if (!list.length) {
+        wall.innerHTML = `<div style="color:var(--muted)">${tlt("noEvents")}</div>`;
+        return;
+    }
+    list.forEach(e => {
+        const card = document.createElement("div");
+        card.className = "wall-card";
+        const thumb = e.snap ? `<img loading="lazy" src="/api/archive/snapshot/${date}/${e.snap}" alt="">` : `<span>—</span>`;
+        card.innerHTML = `
+            <div class="wall-thumb" onclick="playEvent('${date}','${e.cam_id}',${e.start})">${thumb}<span class="wall-dur">${fmtDur(e.end - e.start)}</span></div>
+            <div class="wall-meta"><b>${fmtHMS(e.start)}</b> · <span class="wall-cam"></span></div>
+            <div class="wall-actions">${eventActions(date, e)}</div>`;
+        card.querySelector(".wall-cam").textContent = camName(e.cam_id);
+        wall.appendChild(card);
+    });
+}
+
+function renderEventTable() {
+    const type = document.getElementById("archEvType").value;
+    const date = document.getElementById("archDateSelect").value;
+    const tbody = document.getElementById("archEventBody");
     tbody.innerHTML = "";
-    (data.recordings || []).forEach(rec => {
+    const list = archEvents.filter(e => !type || e.type === type).sort((a, b) => b.start - a.start);
+    if (!list.length) {
+        tbody.innerHTML = `<tr><td colspan="5" style="color:var(--muted)">${tlt("noEvents")}</td></tr>`;
+        return;
+    }
+    list.forEach(e => {
         const tr = document.createElement("tr");
+        const actions = e.type === "motion" ? eventActions(date, e) : "—";
         tr.innerHTML = `
-            <td>${rec.date}</td>
-            <td>${rec.time}</td>
-            <td>${rec.camera_name}</td>
-            <td><span class="badge">${rec.mode}</span></td>
-            <td>${rec.size_mb} MB</td>
-            <td style="display:flex; gap:6px;">
-                <button class="btn btn-primary" onclick="playArchiveVideo('${rec.date}','${rec.filename}')">▶ Play</button>
-                <a class="btn" href="/api/archive/video/${rec.date}/${rec.filename}?download=1" style="text-decoration:none;">⬇ MP4</a>
-                <button class="btn btn-danger" onclick="deleteArchiveVideo('${rec.date}','${rec.filename}')">✕</button>
-            </td>
-        `;
+            <td>${fmtHMS(e.start)} – ${fmtHMS(e.end)}</td>
+            <td></td>
+            <td><span class="ev-badge"><span class="ev-dot" style="background:${EV_COLORS[e.type] || "#6b7280"}"></span>${tlt(e.type === "motion" ? "evtMotion" : "evtOffline")}</span></td>
+            <td>${fmtDur(e.end - e.start)}</td>
+            <td style="display:flex; gap:6px;">${actions}</td>`;
+        tr.children[1].textContent = camName(e.cam_id);
         tbody.appendChild(tr);
     });
 }
 
+function renderArchiveTable() {
+    const tbody = document.getElementById("archiveTableBody");
+    tbody.innerHTML = "";
+    [...archTableRecs].reverse().forEach(rec => {
+        const tr = document.createElement("tr");
+        const actions = rec.status === "ready"
+            ? `<button class="btn btn-primary" onclick="playArchiveVideo('${rec.date}','${rec.filename}')">▶ Play</button>
+               <a class="btn" href="/api/archive/video/${rec.date}/${rec.filename}?download=1" style="text-decoration:none;">⬇ MP4</a>
+               <button class="btn btn-danger" onclick="deleteArchiveVideo('${rec.date}','${rec.filename}')">✕</button>`
+            : `<button class="btn btn-primary" onclick="playArchiveVideo('${rec.date}','${rec.filename}')">▶ Play</button>
+               <span class="badge">${tlt(rec.status)}</span>`;
+        tr.innerHTML = `
+            <td>${rec.date}</td>
+            <td>${fmtHMS(rec.start_sec)} – ${fmtHMS(rec.end_sec)}</td>
+            <td></td>
+            <td><span class="badge">${rec.mode}</span></td>
+            <td>${rec.size_mb} MB</td>
+            <td style="display:flex; gap:6px;">${actions}</td>`;
+        tr.children[2].textContent = rec.camera_name;
+        tbody.appendChild(tr);
+    });
+}
+
+/* ---------- Zeitleiste im Player ---------- */
+function setTlWindow(h) {
+    tlWin = h;
+    [1, 6, 0].forEach(x => document.getElementById(`tlWin${x}`).classList.toggle("active", x === h));
+    loadTimeline();
+}
+
+async function loadTimeline() {
+    if (appState.role !== "admin") return;
+    const sel = document.getElementById("tlDate");
+    const params = new URLSearchParams({date: sel.value, from: "00:00", to: "23:59"});
+    const res = await fetch(`/api/archive?${params.toString()}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    sel.innerHTML = "";
+    (data.available_dates || []).forEach(d => {
+        const opt = document.createElement("option");
+        opt.value = d;
+        opt.textContent = d;
+        if (d === data.selected_date) opt.selected = true;
+        sel.appendChild(opt);
+    });
+    let from = 0, to = 86400;
+    if (data.now_sec !== null && tlWin > 0) {   // heute: Fenster endet bei "jetzt"
+        to = Math.max(data.now_sec, 120);
+        from = Math.max(0, to - tlWin * 3600);
+    }
+    Object.assign(tlDay, {from: from, to: to, nowSec: data.now_sec});
+    document.querySelectorAll("[data-tl]").forEach(el => { el.textContent = tlt(el.dataset.tl); });
+    appState.cameras.forEach(c => {
+        const st = tlCam(c.id);
+        st.recs = (data.recordings || []).filter(r => r.camera_id === c.id);
+        st.events = (data.events || []).filter(e => e.cam_id === c.id);
+        renderTileTimeline(c.id);
+    });
+}
+
+function tlBar(cls, start, end, title) {
+    const b = document.createElement("div");
+    const l = Math.max(0, tlPct(start)), r = Math.min(100, tlPct(end));
+    b.className = cls;
+    b.style.left = l + "%";
+    b.style.width = Math.max(0.2, r - l) + "%";
+    b.title = title;
+    return b;
+}
+
+function renderTileTimeline(id) {
+    const lane = document.getElementById(`tlLane_${id}`);
+    if (!lane) return;
+    const st = tlCam(id);
+    lane.innerHTML = "";
+    st.recs.forEach(r => {
+        if (r.end_sec < tlDay.from || r.start_sec > tlDay.to) return;
+        lane.appendChild(tlBar(
+            "tl-rec " + (r.mode === "MOTION" ? "tl-motionrec" : "tl-rec247") + (r.status !== "ready" ? " tl-" + r.status : ""),
+            r.start_sec, r.end_sec, `${fmtHMS(r.start_sec)} – ${fmtHMS(r.end_sec)} · ${r.mode}`));
+    });
+    st.events.forEach(e => {   // Ereignisse liegen farbig über den Aufnahmen
+        if (e.end < tlDay.from || e.start > tlDay.to) return;
+        lane.appendChild(tlBar("tl-evt tl-evt-" + e.type, e.start, e.end,
+            `${fmtHMS(e.start)} – ${fmtHMS(e.end)} · ${tlt(e.type === "motion" ? "evtMotion" : "evtOffline")}`));
+    });
+
+    const area = document.getElementById(`tlArea_${id}`);
+    const axis = document.getElementById(`tlAxis_${id}`);
+    axis.innerHTML = "";
+    const span = tlDay.to - tlDay.from;
+    const maxTicks = Math.max(3, Math.floor((area.clientWidth || 400) / 60));
+    const step = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600].find(x => span / x <= maxTicks) || 21600;
+    for (let t = Math.ceil(tlDay.from / step) * step; t <= tlDay.to; t += step) {
+        const tick = document.createElement("span");
+        tick.className = "tl-tick";
+        tick.style.left = tlPct(t) + "%";
+        tick.textContent = fmtHMS(t).slice(0, 5);
+        const pct = tlPct(t);
+        if (pct < 4) tick.style.transform = "none";                // linkes Label nicht abschneiden
+        else if (pct > 96) tick.style.transform = "translateX(-100%)";
+        axis.appendChild(tick);
+    }
+    const now = document.getElementById(`tlNow_${id}`);
+    const showNow = tlDay.nowSec !== null && tlDay.nowSec >= tlDay.from && tlDay.nowSec < tlDay.to - 1;
+    now.classList.toggle("hidden", !showNow);
+    if (showNow) now.style.left = tlPct(tlDay.nowSec) + "%";
+    updateCursor(id, st.cursorSec);
+}
+
+function updateCursor(id, sec) {   // sec === null: Live-Position (rechter Rand = jetzt)
+    const st = tlCam(id);
+    st.cursorSec = sec;
+    const c = document.getElementById(`tlCur_${id}`);
+    if (!c) return;
+    const live = sec === null;
+    const pos = live ? tlDay.nowSec : sec;
+    const visible = pos !== null && pos >= tlDay.from && pos <= tlDay.to + 1;
+    c.classList.toggle("hidden", !visible);
+    c.classList.toggle("live", live);
+    if (visible) c.style.left = Math.min(100, tlPct(pos)) + "%";
+    document.getElementById(`tlTime_${id}`).textContent = live ? "" : fmtHMS(sec);
+    document.getElementById(`tlLive_${id}`).classList.toggle("is-live", live);
+}
+
+function seekTile(id, sec, force) {   // force: gezielter Sprung (Galerie/Ereignis) -> nie zurueck auf Live
+    if (!force && tlDay.nowSec !== null && sec >= tlDay.nowSec - 20) { backToLive(id); return; }   // rechter Rand = Live
+    const ready = tlCam(id).recs;   // auch laufende / konvertierende Aufnahmen (Live-Suche)
+    let rec = ready.find(r => sec >= r.start_sec && sec < r.end_sec);
+    const offset = rec ? sec - rec.start_sec : 0;
+    if (!rec) rec = ready.find(r => r.start_sec > sec);   // in Lücke geklickt: zur nächsten Aufnahme springen
+    if (!rec) {
+        // Diagnose: zeigt, welche Dateien der Server fuer diese Kamera/diesen Tag geliefert hat
+        const info = ready.length ? ready.slice(-2).map(r => `${fmtHMS(r.start_sec)}–${fmtHMS(r.end_sec)} ${r.status}`).join(" | ") : "0 Dateien";
+        document.getElementById(`tlTime_${id}`).textContent = `${tlt("none")} (${info}; gesucht ${fmtHMS(sec)})`;
+        console.warn("Keine Aufnahme gefunden", {kamera: id, gesucht: sec, dateien: ready});
+        return;
+    }
+    loadRec(id, rec, offset);
+}
+
+function loadRec(id, rec, offsetSec) {
+    const player = document.getElementById(`vid_${id}`);
+    if (!player) return;
+    const st = tlCam(id);
+    player.classList.remove("hidden");
+    document.getElementById(`img_${id}`).classList.add("hidden");
+    document.getElementById(`plPlay_${id}`).classList.remove("hidden");
+    document.getElementById(`plSpeed_${id}`).classList.remove("hidden");
+    const absStart = rec.start_sec + offsetSec;
+    updateCursor(id, absStart);
+    const cur = st.cur && st.cur.rec;
+    if (cur && cur.filename === rec.filename && cur.date === rec.date && st.cur.scale
+        && (!cur.srcRec || (absStart >= cur.start_sec && absStart < cur.end_sec - 1))) {
+        player.currentTime = (absStart - cur.start_sec) * st.cur.scale;
+        player.play().catch(() => {});
+        return;
+    }
+    let play = rec, offset = offsetSec, src = `/api/archive/video/${rec.date}/${rec.filename}`;
+    if (rec.status !== "ready") {   // laufend / in Konvertierung: Ausschnitt (5 min) serverseitig als H.264 erzeugen
+        const cs = Math.max(rec.start_sec, Math.min(Math.floor(absStart), rec.end_sec - 4));
+        const ce = Math.min(rec.end_sec, cs + 300);
+        play = {date: rec.date, filename: rec.filename, camera_id: rec.camera_id, mode: rec.mode,
+                status: "clip", srcRec: rec, start_sec: cs, end_sec: ce};
+        offset = Math.max(0, absStart - cs);
+        src = "/api/archive/clip?" + new URLSearchParams({date: rec.date, camera_id: rec.camera_id,
+              start: cs.toFixed(1), end: ce.toFixed(1), format: "mp4", inline: "1"}).toString();
+    }
+    st.cur = {rec: play, scale: 0, offset: offset};
+    player.src = src;
+    player.playbackRate = st.rate;
+    player.play().catch(() => {});
+}
+
+function backToLive(id) {
+    const player = document.getElementById(`vid_${id}`);
+    player.pause();
+    player.removeAttribute("src");
+    player.load();
+    player.classList.add("hidden");
+    document.getElementById(`img_${id}`).classList.remove("hidden");
+    document.getElementById(`plPlay_${id}`).classList.add("hidden");
+    document.getElementById(`plSpeed_${id}`).classList.add("hidden");
+    const st = tlCam(id);
+    st.cur = null;
+    st.rate = 1;
+    document.getElementById(`plSpeed_${id}`).textContent = "1×";
+    updateCursor(id, null);
+}
+
+function jumpEvent(id, dir) {   // zum vorigen/naechsten Bewegungsereignis springen (5 s Vorlauf)
+    const st = tlCam(id);
+    const ev = st.events.filter(e => e.type === "motion").sort((a, b) => a.start - b.start);
+    const cur = st.cursorSec !== null ? st.cursorSec : (tlDay.nowSec !== null ? tlDay.nowSec : 86400);
+    const target = dir > 0 ? ev.find(e => e.start - 5 > cur + 1) : [...ev].reverse().find(e => e.start - 5 < cur - 6);
+    if (!target) {
+        document.getElementById(`tlTime_${id}`).textContent = tlt("noEvents");
+        return;
+    }
+    seekTile(id, Math.max(0, target.start - 5));
+}
+
+function plTogglePlay(id) {
+    const p = document.getElementById(`vid_${id}`);
+    if (p.paused) p.play().catch(() => {}); else p.pause();
+}
+function plCycleSpeed(id) {
+    const st = tlCam(id), speeds = [1, 2, 4, 8];
+    st.rate = speeds[(speeds.indexOf(st.rate) + 1) % speeds.length];
+    document.getElementById(`vid_${id}`).playbackRate = st.rate;
+    document.getElementById(`plSpeed_${id}`).textContent = st.rate + "×";
+}
+function plFullscreen(id) {
+    const vp = document.getElementById(`vp_${id}`);
+    if (document.fullscreenElement) document.exitFullscreen(); else vp.requestFullscreen().catch(() => {});
+}
+
+function initTileTimeline(id) {
+    const area = document.getElementById(`tlArea_${id}`);
+    const player = document.getElementById(`vid_${id}`);
+    const bar = area.closest(".pl-bar");
+    const tip = document.getElementById(`tlTip_${id}`);
+    const st = tlCam(id);
+    st.cur = null;
+    st.cursorSec = null;
+    st.dragging = false;
+    st.rate = 1;
+    // Bedienung der Leiste soll nicht das Zoomen/Verschieben des Bildes auslösen
+    ["wheel", "mousedown", "dblclick"].forEach(t => bar.addEventListener(t, e => e.stopPropagation()));
+    const secAt = ev => {
+        const rect = area.getBoundingClientRect();
+        const x = Math.min(Math.max(ev.clientX - rect.left, 0), rect.width);
+        return {sec: tlDay.from + (x / rect.width) * (tlDay.to - tlDay.from), x: x};
+    };
+    area.addEventListener("pointerdown", ev => {
+        st.dragging = true;
+        bar.classList.add("active");
+        area.setPointerCapture(ev.pointerId);
+        updateCursor(id, secAt(ev).sec);
+    });
+    area.addEventListener("pointermove", ev => {
+        const p = secAt(ev);
+        tip.textContent = fmtHMS(p.sec);
+        tip.style.left = p.x + "px";
+        tip.classList.remove("hidden");
+        if (st.dragging) updateCursor(id, p.sec);
+    });
+    area.addEventListener("pointerleave", () => tip.classList.add("hidden"));
+    area.addEventListener("pointerup", ev => {
+        if (!st.dragging) return;
+        st.dragging = false;
+        bar.classList.remove("active");
+        seekTile(id, secAt(ev).sec);
+    });
+    area.addEventListener("pointercancel", () => { st.dragging = false; bar.classList.remove("active"); });
+
+    // Dateien sind teils schneller/langsamer als Echtzeit -> Position per Skalierung umrechnen
+    player.addEventListener("loadedmetadata", () => {
+        if (!st.cur || !isFinite(player.duration)) return;
+        st.cur.scale = player.duration / Math.max(1, st.cur.rec.end_sec - st.cur.rec.start_sec);
+        if (st.cur.offset) player.currentTime = st.cur.offset * st.cur.scale;
+        player.playbackRate = st.rate;
+    });
+    player.addEventListener("timeupdate", () => {
+        if (st.cur && st.cur.scale && !st.dragging) updateCursor(id, st.cur.rec.start_sec + player.currentTime / st.cur.scale);
+    });
+    player.addEventListener("play", () => { document.getElementById(`plPlay_${id}`).textContent = "⏸"; });
+    player.addEventListener("pause", () => { document.getElementById(`plPlay_${id}`).textContent = "▶"; });
+    player.addEventListener("ended", () => {
+        if (!st.cur) return;
+        const cr = st.cur.rec, base = cr.srcRec || cr;
+        const fresh = st.recs.find(r => r.filename === base.filename && r.date === base.date) || base;
+        if (cr.srcRec && cr.end_sec < fresh.end_sec - 2) { loadRec(id, fresh, cr.end_sec - fresh.start_sec); return; }
+        const next = st.recs.find(r => r.filename !== base.filename && r.start_sec >= fresh.end_sec - 1);
+        if (next) loadRec(id, next, 0);
+    });
+}
+
+// heutigen Tag regelmäßig aktualisieren (laufende Aufnahme, neue Ereignisse, mitwandelndes Zeitfenster)
+setInterval(() => {
+    const busy = Object.values(tlCams).some(c => c.dragging);
+    if (tlDay.nowSec !== null && !busy && !document.getElementById("viewLive").classList.contains("hidden")) loadTimeline();
+}, 15000);
+
+async function openInPlayer(dateStr, camId, sec, filename) {
+    document.getElementById("tlDate").value = dateStr;
+    tlWin = 0;
+    [1, 6, 0].forEach(x => document.getElementById(`tlWin${x}`).classList.toggle("active", x === 0));
+    switchMainTab("live");
+    await loadTimeline();
+    if (filename) {
+        const rec = tlCam(camId).recs.find(r => r.filename === filename);
+        if (rec) loadRec(camId, rec, 0);
+    } else {
+        seekTile(camId, sec, true);
+    }
+}
+function playEvent(dateStr, camId, startSec) { openInPlayer(dateStr, camId, Math.max(0, startSec - 5)); }
 function playArchiveVideo(dateStr, filename) {
-    const player = document.getElementById("archiveVideoPlayer");
-    document.getElementById("videoModalTitle").textContent = `${dateStr} - ${filename}`;
-    player.src = `/api/archive/video/${dateStr}/${filename}`;
-    document.getElementById("videoModal").classList.remove("hidden");
-    player.play();
+    const rec = archTableRecs.find(r => r.filename === filename && r.date === dateStr);
+    if (rec) openInPlayer(dateStr, rec.camera_id, rec.start_sec, filename);
 }
 
 function closeVideoModal() {

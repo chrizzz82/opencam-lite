@@ -5,13 +5,22 @@ services:
     image: opencam-lite:latest
     container_name: opencam-lite
     restart: unless-stopped
-    ports:
-      - "8080:8080"
+    # Host-Netzwerk: Kameras im LAN werden automatisch gefunden.
+    # Die Oberflaeche ist dann unter http://<server-ip>:7777 erreichbar.
+    network_mode: host
     environment:
       - TZ=Europe/Berlin
-      - SECRET_KEY=opencam_local_secret_key_change_if_needed
-      - CONFIG_DIR=/config
-      - RECORDINGS_DIR=/recordings
+      - PORT=7777
+      # Optional: Speicherlimit in GB (die aeltesten Tage werden zuerst geloescht)
+      # - MAX_STORAGE_GB=500
+      # Optional: NAS-Backup (Netzfreigabe auf dem Host einbinden, unten bei volumes durchreichen)
+      # - BACKUP_DIR=/backup
+      # - BACKUP_KEEP_DAYS=90
+      # Optional: MQTT (Topics: opencam/<Kameraname>/motion und /online)
+      # - MQTT_HOST=192.168.178.10
+      # - MQTT_USER=
+      # - MQTT_PASSWORD=
     volumes:
       - /DATA/AppData/opencam-lite/config:/config
       - /DATA/AppData/opencam-lite/recordings:/recordings
+      # - /DATA/Media/Backup/opencam:/backup

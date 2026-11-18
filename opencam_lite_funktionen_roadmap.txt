@@ -1,0 +1,28 @@
+================================================================================
+OPENCAM LITE - AKTUELLE FUNKTIONEN & ROADMAP
+================================================================================
+
+1. AKTUELLE FUNKTIONEN & EIGENSCHAFTEN
+--------------------------------------------------------------------------------
+- Live-Grid-Ansicht: Kachellayout mit 1-4 Spalten oder freier Breite, Kachel folgt dem Bildformat der Kamera (keine schwarzen Balken), stufenloser digitaler Zoom und Verschieben (Pan).
+- Stream-Unterstützung: Kompatibel mit TP-Link Tapo, Hikvision, Reolink und generischen ONVIF/RTSP-Quellen.
+- Aufnahmemodi: Flexibel pro Kamera einstellbar (Nur Live, Aufnahme bei Bewegung, 24/7-Daueraufnahme).
+- Visueller Zonen-Editor: Privatzonen (Schwärzung) und Bewegungszonen mit einstellbarer Empfindlichkeit, Vorschau beim Zeichnen, Undo, Löschen per Rechtsklick, Live-Anzeige der Bewegungserkennung.
+- Player-Zeitleiste (wie YouTube): In jeder Kachel farbcodierte Darstellung von 24/7-Aufnahmen, Bewegungsaufnahmen, Bewegungsereignissen und Offline-Phasen; im Live-Stream zurückgehen, Fenster 1h/6h/24h, Wiedergabegeschwindigkeit, Vollbild, Sprung zum vorigen/nächsten Ereignis.
+- Ereignis-Archiv: Filter nach Datum, Zeitfenster (Von/Bis), Kamera und Ereignistyp; Ereignisse abspielen sowie als MP4-Clip oder animiertes GIF herunterladen; Aufnahmenliste mit tage- oder zeitweisem ZIP-Export.
+- Snapshot-Galerie (Event-Wall): Pro Bewegungsereignis ein Vorschaubild, anklickbar zum Abspielen.
+- Aufnahmen browserfähig: Rohaufnahmen (.rec.mp4) werden nach jedem Segment automatisch in H.264 (faststart) umgewandelt.
+- Speicherverwaltung: Aufbewahrung in Tagen, optionales GB-Limit (MAX_STORAGE_GB), Anzeige von Belegung und Backup-Status.
+- NAS-Backup: Abgeschlossene Tage werden auf ein eingebundenes Netzlaufwerk gespiegelt (BACKUP_DIR, optional BACKUP_KEEP_DAYS).
+- PTZ-Steuerung: Schwenken, Neigen und Zoomen für ONVIF-kompatible Kameras inklusive WS-Security Digest-Authentifizierung.
+- Integrationen & Alarme: Push-Benachrichtigungen via ntfy.sh, Webhooks für Home Assistant und MQTT (Bewegung/Online-Status).
+- Sicherheit & Administration: Rollenbasierte Benutzerverwaltung (Administrator vs. Read-Only), Login-Sperre nach Fehlversuchen, automatischer geheimer Schlüssel, Healthcheck, hybrider Subnet-Netzwerkscanner.
+
+2. ZUKÜNFTIGE ROADMAP & FUNKTIONSIDEEN
+--------------------------------------------------------------------------------
+- Dual-Stream-Unterstützung: Automatisches Umschalten zwischen ressourcenschonenden Sub-Streams für die Rasteransicht und hochauflösenden Main-Streams für Aufnahmen und die Vollansicht (schont CPU & Bandbreite).
+- Direkte Aufnahme per FFmpeg ohne Neukodierung (spart CPU, exakte Zeiten) und Vorlauf vor der Bewegung.
+- MQTT-Erweiterung: Home-Assistant-Discovery und Einstellung der Verbindung in der Oberfläche.
+- Backup-Erweiterung: Auswahl von Backup-Ziel und Aufbewahrung in der Oberfläche, Archivansicht direkt aus dem Backup.
+- Personen- und Fahrzeugerkennung gegen Fehlalarme, Benachrichtigungen mit Schnappschuss.
+================================================================================
