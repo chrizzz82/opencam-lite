@@ -1,1994 +1,2634 @@
 import os
-import io
-import re
-import cv2
-import time
 import json
-import uuid
-import base64
-import socket
-import subprocess
-import queue
+import re
+import time
 import shutil
-import tempfile
-import zipfile
-import hashlib
 import threading
-import datetime
+import subprocess
 import requests
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import wraps
-from flask import (
-    Flask, Response, render_template, request, jsonify,
-    session, redirect, url_for, send_file, abort, after_this_request
-)
-from werkzeug.security import generate_password_hash, check_password_hash
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict
+from fastapi import FastAPI, Form, HTTPException, Response
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from pydantic import BaseModel
+from PIL import Image
 
-APP_VERSION = "v0.3.0"
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "chrizzz82/opencam-lite")
-PORT = int(os.environ.get("PORT", 7777))
+app = FastAPI(title="Theme Fetcher")
 
-# RTSP über TCP erzwingen und Timeout setzen (verhindert Hänger bei Tapo/Hikvision)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
+DATA_DIR = Path("/data")
+COLLECTIONS_DIR = DATA_DIR / "collections"
+LOCAL_THEMES_DIR = DATA_DIR / "local_themes"
+CONFIG_FILE = DATA_DIR / "config.json"
+STATE_FILE = DATA_DIR / "state.json"
 
-TEMPLATE_DIR = "templates" if os.path.isdir("templates") and os.path.exists(os.path.join("templates", "index.html")) else "."
-app = Flask(__name__, template_folder=TEMPLATE_DIR)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+COLLECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_THEMES_DIR.mkdir(parents=True, exist_ok=True)
 
-CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
-RECORDINGS_DIR = os.environ.get("RECORDINGS_DIR", "/recordings")
+DEFAULT_CONFIG = {
+    "local_media_paths": os.getenv("LOCAL_MEDIA_DIR", "/media"),
+    "local_scan_enabled": os.getenv("LOCAL_SCAN_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "jellyfin_url": os.getenv("JELLYFIN_URL", "").rstrip("/"),
+    "jellyfin_api_key": os.getenv("JELLYFIN_API_KEY", ""),
+    "jf_metadata_dir": os.getenv("JF_METADATA_DIR", "/jellyfin-metadata"),
+    "plex_url": os.getenv("PLEX_URL", "").rstrip("/"),
+    "plex_token": os.getenv("PLEX_TOKEN", ""),
+    "min_duration_sec": int(os.getenv("MIN_DURATION_SEC", "25")),
+    "max_duration_sec": int(os.getenv("MAX_DURATION_SEC", "270")),
+    "scan_interval_hours": int(os.getenv("SCAN_INTERVAL_HOURS", "12")),
+    "audio_fade": True,
+    "embed_cover": True,
+    "auto_download": False,
+    "ui_language": "de"
+}
 
-os.makedirs(CONFIG_DIR, exist_ok=True)
-os.makedirs(RECORDINGS_DIR, exist_ok=True)
+EXCLUDE_KEYWORDS = [
+    "scene", "szene", "clip", "movieclip", "movie clip", "dialog", "dialogue",
+    "teaser", "trailer", "ausschnitt", "interview", "making of", "featurette",
+    "reaction", "reaktion", "review", "kritik", "talk", "hörspiel", "ganzer film",
+    "full movie", "parody", "parodie", "gameplay", "walkthrough", "1 hour",
+    "10 hours", "loop", "tutorial", "piano", "klavier", "guitar", "gitarre",
+    "karaoke", "bass boosted", "nightcore", "slowed", "reverb", "8d audio",
+    "extended", "compilation", "suite", "blooper", "deleted scene", "fight scene",
+    "ending scene", "death scene"
+]
+
+THEME_REGEX = re.compile(r".*themes?.*\.(mp3|m4a|flac|ogg|wav|aac|opus)$", re.IGNORECASE)
+
+# Multi-Language Dictionary
+LANG_PACK = {
+    "de": {
+        "app_title": "Theme Fetcher",
+        "movies": "Filme",
+        "shows": "Serien",
+        "collections": "Collections",
+        "libraries": "Eingelesene Mediatheken",
+        "movies_plural": "Filme",
+        "shows_plural": "Serien",
+        "collections_plural": "Collections",
+        "all_media": "alle Medien",
+        "settings": "Einstellungen",
+        "settings_title": "Einstellungen & Quellen",
+        "back_to_lib": "← Zurück zur Mediathek",
+        "scan_only": "🔍 Nur {scope} scannen",
+        "scan_all": "🌐 Alles scannen",
+        "download_missing": "⬇️ {scope} laden ({count})",
+        "cancel": "🛑 Abbrechen",
+        "cancelling": "Abbruch angefordert...",
+        "cancel_requested": "Abbruch angefordert",
+        "ready": "Bereit",
+        "scanning": "Lese {scope} ein...",
+        "fetching_jf": "Lese Jellyfin ({scope}) ein...",
+        "fetching_plex": "Lese Plex ({scope}) ein...",
+        "scanning_local": "Prüfe lokale Ordner ({scope})...",
+        "scan_cancelled": "Scan abgebrochen!",
+        "scan_complete": "Scan abgeschlossen: {count} {scope} erfasst.",
+        "scan_error": "Fehler beim Scan: {err}",
+        "init_queue": "Initialisiere Download-Warteschlange...",
+        "no_missing": "Keine fehlenden Themes in dieser Kategorie!",
+        "download_cancelled": "Download abgebrochen!",
+        "downloading_item": "Lade ({idx}/{total}): {title}...",
+        "download_complete": "Download fertig! {down} geladen, {fail} fehlgeschlagen.",
+        "download_error": "Fehler beim Download: {err}",
+        "searching_soundtrack": "Suche Soundtrack...",
+        "no_soundtrack_found": "Kein Soundtrack gefunden",
+        "no_clean_theme": "Keine reine Titelmusik gefunden (nur Trailer/Szenen oder keine Treffer)",
+        "downloading_candidate": "Lade ({idx}/{total}): {title}...",
+        "mastering_audio": "Schneide Audio (Fade-In/Out)...",
+        "download_success": "Erfolgreich geladen!",
+        "error_prefix": "Fehler: ",
+        "all_failed": "Alle Treffer fehlgeschlagen ({err})",
+        "op_in_progress": "Aktion läuft...",
+        "processing": "Verarbeite...",
+        "downloaded_stat": "Erfolgreich geladen",
+        "failed_stat": "Fehler",
+        "next_in_queue": "📋 Nächste in der Download-Warteschlange:",
+        "recently_finished": "✓ Zuletzt abgeschlossen:",
+        "no_more_queue": "Keine weiteren Titel in der Warteschlange.",
+        "filter_label": "Filter:",
+        "all_pill": "Alle ({count})",
+        "missing_pill": "❌ Fehlt ({count})",
+        "present_pill": "✓ Vorhanden ({count})",
+        "search_placeholder": "{scope} durchsuchen...",
+        "search_btn": "Suchen",
+        "th_cover": "Cover",
+        "th_title_path": "Titel & Pfad",
+        "th_status": "Status",
+        "th_preview": "Vorschau",
+        "th_actions": "Aktionen",
+        "th_progress": "Fortschritt",
+        "status_present": "✓ Vorhanden",
+        "status_missing": "✕ Fehlt",
+        "status_ready": "✓ Bereit",
+        "no_entries": "Keine Einträge unter {scope} gefunden.",
+        "btn_select": "🎵 Auswählen",
+        "btn_select_title": "Theme auswählen (Top Vorschläge vorhören)",
+        "btn_dl_placeholder": "YouTube URL...",
+        "btn_dl_title": "Direkt laden",
+        "btn_recheck_title": "Nur diesen Eintrag neu prüfen",
+        "btn_delete_confirm": "Theme löschen und sperren?",
+        "btn_delete_title": "Löschen & Blockieren",
+        "modal_title": "🎵 Theme-Vorschläge: {title}",
+        "modal_search_placeholder": "Titel / Komponist / YouTube URL...",
+        "modal_search_btn": "🔍 Neue Suche",
+        "modal_searching": "Suche Soundtrack-Kandidaten (MusicBrainz, ThemerrDB, YouTube)...",
+        "modal_identified": "🎯 <strong>Erkannter Soundtrack:</strong> {display} <span style=\"color:#8b929a;\">(Quelle: {source})</span>",
+        "modal_no_matches": "Keine passenden Soundtracks gefunden. Probiere einen anderen Suchbegriff oben!",
+        "modal_open_yt": "Auf YouTube öffnen ↗",
+        "modal_length": "Länge: ",
+        "modal_apply": "✓ Übernehmen",
+        "settings_saved_banner": "✓ Einstellungen erfolgreich gespeichert!",
+        "sec_local": "📁 1. Lokale Medienquellen (Festplatte)",
+        "btn_test_path": "📂 Pfad testen",
+        "lbl_paths": "Medienpfad(e) im Container",
+        "sub_paths": "Standard: <code>/media</code>. Entspricht deinem Docker Volume Mount.",
+        "lbl_local_scan": "Lokalen Festplatten-Scan aktivieren (wird automatisch dedupliziert)",
+        "sec_servers": "🎬 2. Medienserver (Jellyfin / Plex)",
+        "btn_test_jf": "🔌 Jellyfin testen",
+        "btn_test_plex": "🍿 Plex testen",
+        "lbl_jf_url": "Jellyfin Server-IP & Port",
+        "sub_jf_url": "Standard-Port: <strong>8096</strong> (z. B. <code>192.168.178.50:8096</code>)",
+        "lbl_jf_key": "Jellyfin API-Key",
+        "sub_jf_key": "Erstellt unter Jellyfin: Dashboard ➔ API-Schlüssel",
+        "lbl_plex_url": "Plex Server-IP & Port (Optional)",
+        "sub_plex_url": "Standard-Port: <strong>32400</strong> (z. B. <code>192.168.178.50:32400</code>)",
+        "lbl_plex_token": "Plex Token (Optional)",
+        "sub_plex_token": "Dein persönlicher X-Plex-Token",
+        "sec_audio": "⚡ 3. Download-Kriterien & Audio-Veredelung",
+        "lbl_min_dur": "Min. Titellänge (Sekunden)",
+        "sub_min_dur": "Verhindert Jingles und kurze Soundeffekte (Standard: 25s)",
+        "lbl_max_dur": "Max. Titellänge (Sekunden)",
+        "sub_max_dur": "Verhindert ganze Alben und Loops (Standard: 270s)",
+        "lbl_fade": "<strong>Sanftes Ein- und Ausblenden (Fade-In / Fade-Out):</strong> 1.5s sanft anblenden, 3s ausblenden",
+        "sec_lang": "🌐 4. Sprache / Language",
+        "lbl_lang": "Benutzeroberfläche / Interface Language",
+        "btn_save_settings": "💾 Einstellungen speichern & anwenden",
+        "btn_cancel_settings": "Abbrechen",
+        "lib_title": "Gefundene Mediatheken & Verzeichnisse:",
+        "lib_desc": "Hier siehst du alle Mediatheken und Pfade, die Jellyfin und deine Festplatte gemeldet haben:",
+        "lib_empty": "Bisher keine Bibliotheken erfasst. Klicke auf 'Alles scannen'!"
+    },
+    "en": {
+        "app_title": "Theme Fetcher",
+        "movies": "Movies",
+        "shows": "TV Shows",
+        "collections": "Collections",
+        "libraries": "Libraries",
+        "movies_plural": "Movies",
+        "shows_plural": "TV Shows",
+        "collections_plural": "Collections",
+        "all_media": "all media",
+        "settings": "Settings",
+        "settings_title": "Settings & Sources",
+        "back_to_lib": "← Back to Library",
+        "scan_only": "🔍 Scan {scope} Only",
+        "scan_all": "🌐 Scan All",
+        "download_missing": "⬇️ Download {scope} ({count})",
+        "cancel": "🛑 Cancel",
+        "cancelling": "Cancelling...",
+        "cancel_requested": "Cancellation requested",
+        "ready": "Ready",
+        "scanning": "Scanning {scope}...",
+        "fetching_jf": "Fetching Jellyfin ({scope})...",
+        "fetching_plex": "Fetching Plex ({scope})...",
+        "scanning_local": "Scanning local folders ({scope})...",
+        "scan_cancelled": "Scan cancelled!",
+        "scan_complete": "Scan complete: {count} {scope} indexed.",
+        "scan_error": "Scan error: {err}",
+        "init_queue": "Initializing download queue...",
+        "no_missing": "No missing themes in this category!",
+        "download_cancelled": "Download cancelled!",
+        "downloading_item": "Downloading ({idx}/{total}): {title}...",
+        "download_complete": "Download complete! {down} downloaded, {fail} failed.",
+        "download_error": "Download error: {err}",
+        "searching_soundtrack": "Searching soundtrack...",
+        "no_soundtrack_found": "No soundtrack found",
+        "no_clean_theme": "No clean theme music found (only trailers/scenes or no matches)",
+        "downloading_candidate": "Downloading ({idx}/{total}): {title}...",
+        "mastering_audio": "Mastering audio (Fade-in/out)...",
+        "download_success": "Successfully downloaded!",
+        "error_prefix": "Error: ",
+        "all_failed": "All candidates failed ({err})",
+        "op_in_progress": "Operation in progress...",
+        "processing": "Processing...",
+        "downloaded_stat": "Downloaded",
+        "failed_stat": "Failed",
+        "next_in_queue": "📋 Next in Download Queue:",
+        "recently_finished": "✓ Recently Finished:",
+        "no_more_queue": "No more items in queue.",
+        "filter_label": "Filter:",
+        "all_pill": "All ({count})",
+        "missing_pill": "❌ Missing ({count})",
+        "present_pill": "✓ Present ({count})",
+        "search_placeholder": "Search {scope}...",
+        "search_btn": "Search",
+        "th_cover": "Cover",
+        "th_title_path": "Title & Path",
+        "th_status": "Status",
+        "th_preview": "Preview",
+        "th_actions": "Actions",
+        "th_progress": "Progress",
+        "status_present": "✓ Present",
+        "status_missing": "✕ Missing",
+        "status_ready": "✓ Ready",
+        "no_entries": "No entries found in {scope}.",
+        "btn_select": "🎵 Select",
+        "btn_select_title": "Select theme (preview top recommendations)",
+        "btn_dl_placeholder": "YouTube URL / query...",
+        "btn_dl_title": "Download directly",
+        "btn_recheck_title": "Re-check this item",
+        "btn_delete_confirm": "Delete theme and block URL?",
+        "btn_delete_title": "Delete & block",
+        "modal_title": "🎵 Theme Recommendations: {title}",
+        "modal_search_placeholder": "Title / Composer / YouTube URL...",
+        "modal_search_btn": "🔍 Search",
+        "modal_searching": "Searching soundtrack candidates (MusicBrainz, Wikidata, YouTube)...",
+        "modal_identified": "🎯 <strong>Identified Soundtrack:</strong> {display} <span style=\"color:#8b929a;\">(Source: {source})</span>",
+        "modal_no_matches": "No matching soundtracks found. Try a different search query above!",
+        "modal_open_yt": "Open on YouTube ↗",
+        "modal_length": "Length: ",
+        "modal_apply": "✓ Apply",
+        "settings_saved_banner": "✓ Settings saved successfully!",
+        "sec_local": "📁 1. Local Media Storage (Hard Drives & Mounts)",
+        "btn_test_path": "📂 Test Path",
+        "lbl_paths": "Container Media Path(s)",
+        "sub_paths": "Default: <code>/media</code>. Matches your Docker volume mount.",
+        "lbl_local_scan": "Enable local storage scan (automatically deduplicated with Jellyfin/Plex)",
+        "sec_servers": "🎬 2. Media Servers (Jellyfin / Plex)",
+        "btn_test_jf": "🔌 Test Jellyfin",
+        "btn_test_plex": "🍿 Test Plex",
+        "lbl_jf_url": "Jellyfin Server IP & Port",
+        "sub_jf_url": "Default Port: <strong>8096</strong> (e.g. <code>192.168.1.50:8096</code>)",
+        "lbl_jf_key": "Jellyfin API Key",
+        "sub_jf_key": "Generated in Jellyfin: Dashboard ➔ API Keys",
+        "lbl_plex_url": "Plex Server IP & Port (Optional)",
+        "sub_plex_url": "Default Port: <strong>32400</strong> (e.g. <code>192.168.1.50:32400</code>)",
+        "lbl_plex_token": "Plex Token (Optional)",
+        "sub_plex_token": "Your personal X-Plex-Token",
+        "sec_audio": "⚡ 3. Download Criteria & Audio Mastering",
+        "lbl_min_dur": "Min. Track Duration (seconds)",
+        "sub_min_dur": "Prevents stingers, logos and sound effects (Default: 25s)",
+        "lbl_max_dur": "Max. Track Duration (seconds)",
+        "sub_max_dur": "Prevents full OST albums and long loops (Default: 270s)",
+        "lbl_fade": "<strong>Smooth Audio Fade-In & Fade-Out:</strong> 1.5s gentle fade-in, 3.0s fade-out",
+        "sec_lang": "🌐 4. Interface Language",
+        "lbl_lang": "Select UI Language",
+        "btn_save_settings": "💾 Save & Apply Settings",
+        "btn_cancel_settings": "Cancel",
+        "lib_title": "Discovered Libraries & Media Directories:",
+        "lib_desc": "Overview of all storage paths and media server libraries indexed by Theme Fetcher:",
+        "lib_empty": "No libraries indexed yet. Click 'Scan All' to scan your media!"
+    }
+}
+
+def get_t(cfg: dict, key: str, **kwargs) -> str:
+    lang = cfg.get("ui_language", "de")
+    pack = LANG_PACK.get(lang, LANG_PACK["de"])
+    val = pack.get(key, LANG_PACK["en"].get(key, key))
+    if kwargs:
+        try:
+            return val.format(**kwargs)
+        except Exception:
+            return val
+    return val
 
 
-def load_or_create_secret_key():
-    """SECRET_KEY aus Umgebung, sonst einmalig zufaellig erzeugen und in /config speichern."""
-    env_key = os.environ.get("SECRET_KEY", "").strip()
-    if env_key:
-        return env_key
-    key_file = os.path.join(CONFIG_DIR, "secret.key")
-    try:
-        with open(key_file, encoding="utf-8") as f:
-            key = f.read().strip()
-        if key:
-            return key
-    except OSError:
-        pass
-    key = uuid.uuid4().hex + uuid.uuid4().hex
-    try:
-        with open(key_file, "w", encoding="utf-8") as f:
-            f.write(key)
-        os.chmod(key_file, 0o600)
-    except OSError:
-        pass
-    return key
+state_lock = threading.Lock()
+stop_requested = False
 
-
-app.secret_key = load_or_create_secret_key()
-
-USERS_FILE = os.path.join(CONFIG_DIR, "users.json")
-CAMERAS_FILE = os.path.join(CONFIG_DIR, "cameras.json")
-SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
-
-config_lock = threading.Lock()
-workers_lock = threading.Lock()
-camera_workers = {}
-
-update_cache = {
-    "last_checked": 0,
-    "latest_version": APP_VERSION,
-    "update_available": False,
-    "repo_url": f"https://github.com/{GITHUB_REPO}"
+scan_progress = {
+    "is_running": False,
+    "action_type": "",
+    "current_step": "Ready",
+    "current_item_id": "",
+    "current_item_title": "",
+    "item_status": {},  # item_id -> {"status": str, "percent": int, "step": str}
+    "processed": 0,
+    "total": 0,
+    "percent": 0,
+    "new_downloaded": 0,
+    "failed": 0,
+    "queue": [],
+    "recent_finished": []
 }
 
 
-# ==============================================================================
-# UPDATE-CHECK GEGEN GITHUB
-# ==============================================================================
+def clean_url_input(val: str) -> str:
+    val = (val or "").strip().rstrip("/")
+    if not val:
+        return ""
+    if not val.startswith("http://") and not val.startswith("https://"):
+        return f"http://{val}"
+    return val
 
-def parse_version_tuple(v_str):
-    cleaned = re.sub(r"[^0-9.]", "", str(v_str or ""))
-    parts = [int(p) for p in cleaned.split(".") if p.isdigit()]
-    return tuple(parts) if parts else (0, 0, 0)
 
-
-def check_for_updates(force=False):
-    now = time.time()
-    if not force and (now - update_cache["last_checked"] < 900):
-        return update_cache
-
-    settings = load_json(SETTINGS_FILE, {})
-    repo = (settings.get("github_repo") or GITHUB_REPO).strip()
-    remote_version = None
-
-    try:
-        raw_url = f"https://raw.githubusercontent.com/{repo}/main/server.py"
-        resp = requests.get(raw_url, timeout=3.5, headers={"Cache-Control": "no-cache"})
-        if resp.status_code == 200:
-            match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', resp.text)
-            if match:
-                remote_version = match.group(1).strip()
-    except Exception:
-        pass
-
-    if not remote_version:
+def load_config() -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    if CONFIG_FILE.exists():
         try:
-            api_url = f"https://api.github.com/repos/{repo}/releases/latest"
-            resp = requests.get(api_url, timeout=3.5)
-            if resp.status_code == 200:
-                tag = resp.json().get("tag_name")
-                if tag:
-                    remote_version = tag.strip()
+            stored = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            cfg.update(stored)
+        except Exception as e:
+            print(f"[Config Warnung] {e}")
+    return cfg
+
+
+def save_config(cfg: dict):
+    with state_lock:
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
-
-    if remote_version:
-        is_newer = parse_version_tuple(remote_version) > parse_version_tuple(APP_VERSION)
-        update_cache["latest_version"] = remote_version
-        update_cache["update_available"] = is_newer
-    else:
-        update_cache["latest_version"] = APP_VERSION
-        update_cache["update_available"] = False
-
-    update_cache["last_checked"] = now
-    update_cache["repo_url"] = f"https://github.com/{repo}"
-    return update_cache
+    return {"items": {}, "blacklist": {}, "folders": [], "soundtrack_cache": {}}
 
 
-# ==============================================================================
-# KONFIGURATION & PERSISTENZ (ÜBERSCHREIBT NIEMALS VORHANDENE DATEIEN)
-# ==============================================================================
-
-def load_json(path, default):
-    with config_lock:
-        if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(default, f, indent=4, ensure_ascii=False)
-            return default
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"[Config] Warnung beim Lesen von {path}: {e}")
-            return default
+def save_state(state: dict):
+    with state_lock:
+        STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def save_json(path, data):
-    with config_lock:
-        temp_path = path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        os.replace(temp_path, path)
+def slugify(text: str) -> str:
+    clean = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE).strip().lower()
+    return re.sub(r"[-\s]+", "_", clean) or "item"
 
 
-def init_configs():
-    # Nur anlegen, wenn die Datei noch überhaupt nicht existiert
-    if not os.path.exists(USERS_FILE):
-        default_users = {
-            "admin": {
-                "password_hash": generate_password_hash("admin"),
-                "role": "admin",
-                "created_at": datetime.datetime.now().isoformat()
-            }
-        }
-        save_json(USERS_FILE, default_users)
-
-    if not os.path.exists(CAMERAS_FILE):
-        save_json(CAMERAS_FILE, [])
-
-    default_settings = {
-        "language": "de",
-        "recording_interval": 15,
-        "retention_days": 7,
-        "motion_post_buffer": 15,
-        "ntfy_url": "",
-        "ha_webhook_url": "",
-        "alert_cooldown": 60,
-        "github_repo": GITHUB_REPO
-    }
-    if not os.path.exists(SETTINGS_FILE):
-        save_json(SETTINGS_FILE, default_settings)
-    else:
-        current_settings = load_json(SETTINGS_FILE, default_settings)
-        changed = False
-        for k, v in default_settings.items():
-            if k not in current_settings:
-                current_settings[k] = v
-                changed = True
-        if changed:
-            save_json(SETTINGS_FILE, current_settings)
+def normalize_tab(tab_name: str) -> str:
+    t = (tab_name or "").lower().strip()
+    if "seri" in t or "show" in t or "tv" in t:
+        return "shows"
+    if "col" in t or "box" in t:
+        return "collections"
+    if "ordn" in t or "fold" in t or "lib" in t:
+        return "libraries"
+    return "movies"
 
 
-init_configs()
-
-
-def ensure_daily_folders():
-    now = datetime.datetime.now()
-    for delta in (0, 1):
-        day_str = (now + datetime.timedelta(days=delta)).strftime("%Y-%m-%d")
-        day_path = os.path.join(RECORDINGS_DIR, day_str)
-        os.makedirs(day_path, exist_ok=True)
-
-
-EVENT_LOCK = threading.Lock()
-TRANSCODE_SEM = threading.Semaphore(1)
-CLIP_SEM = threading.Semaphore(2)
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-
-def log_event(cam_id, cam_name, ev_type, ts=None, extra=None):
-    """Schreibt Ereignisse (motion_start/_end, offline_start/_end) in <tag>/events.jsonl."""
-    when = datetime.datetime.fromtimestamp(ts) if ts else datetime.datetime.now()
-    day = os.path.join(RECORDINGS_DIR, when.strftime("%Y-%m-%d"))
+def find_theme_file_in_dir(d: Path) -> Optional[Path]:
+    """Findet tolerant jede Theme-Audiodatei im Ordner oder in Staffel-Unterordnern"""
+    if not d.exists() or not d.is_dir():
+        return None
     try:
-        os.makedirs(day, exist_ok=True)
-        line = json.dumps({"ts": when.timestamp(), "cam_id": cam_id, "cam": cam_name, "type": ev_type, **(extra or {})})
-        with EVENT_LOCK:
-            with open(os.path.join(day, "events.jsonl"), "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-    except Exception as e:
-        print(f"[Events] Fehler: {e}")
-
-
-def load_events(date_str):
-    path = os.path.join(RECORDINGS_DIR, date_str, "events.jsonl")
-    midnight = datetime.datetime.strptime(date_str, "%Y-%m-%d").timestamp()
-    now_sec = (time.time() - midnight) if date_str == datetime.date.today().isoformat() else 86400.0
-    opened, snaps, out = {}, {}, []
-
-    def make(key, start, end):
-        ev = {"cam_id": key[0], "type": key[1], "start": start, "end": end}
-        if snaps.get(key):
-            ev["snap"] = snaps[key]
-        return ev
-
-    if os.path.isfile(path):
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    e = json.loads(line)
-                    kind, _, edge = e["type"].rpartition("_")
-                    sec = max(0.0, min(86400.0, float(e["ts"]) - midnight))
-                except (ValueError, KeyError):
-                    continue
-                key = (e.get("cam_id"), kind)
-                if edge == "start":
-                    if key in opened:  # alter Start ohne Ende (z.B. Neustart)
-                        out.append(make(key, opened[key], opened[key] + 1))
-                    opened[key] = sec
-                    snaps[key] = e.get("snap")
-                elif edge == "end" and key in opened:
-                    start = opened.pop(key)
-                    out.append(make(key, start, max(sec, start + 1)))
-    for key, start in opened.items():
-        w = camera_workers.get(key[0])
-        live = bool(w and w.evt_open.get(key[1]))
-        out.append(make(key, start, max(start + 1, now_sec) if live else start + 1))
-    return out
-
-
-def save_snapshot(cam_id, frame):
-    """Speichert beim Start einer Bewegung ein Vorschaubild (Privatzonen sind bereits geschwaerzt)."""
-    now = datetime.datetime.now()
-    folder = os.path.join(RECORDINGS_DIR, now.strftime("%Y-%m-%d"), "snapshots")
-    name = f"{cam_id}__{now.strftime('%H-%M-%S')}.jpg"
-    try:
-        os.makedirs(folder, exist_ok=True)
-        h, w = frame.shape[:2]
-        if w > 640:
-            frame = cv2.resize(frame, (640, int(h * 640 / w)))
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
-        if ok:
-            with open(os.path.join(folder, name), "wb") as f:
-                f.write(buf.tobytes())
-            return name
-    except Exception as e:
-        print(f"[Snapshot] Fehler: {e}")
+        for f in d.iterdir():
+            if f.is_file() and THEME_REGEX.match(f.name):
+                return f
+        for sub in d.iterdir():
+            if sub.is_dir() and re.search(r"season|staffel|\bs\d+", sub.name, re.IGNORECASE):
+                for sf in sub.iterdir():
+                    if sf.is_file() and THEME_REGEX.match(sf.name):
+                        return sf
+    except Exception:
+        pass
     return None
 
 
-# ---- NAS-Backup: abgeschlossene Tage auf ein eingebundenes Laufwerk spiegeln -------------------
-BACKUP_DIR = os.environ.get("BACKUP_DIR", "").strip()
-BACKUP_KEEP_DAYS = int(os.environ.get("BACKUP_KEEP_DAYS", "0") or 0)
-BACKUP_STATE = {"last_run": None, "last_error": "", "files": 0}
-BACKUP_LOCK = threading.Lock()
+def find_local_cover_image(d: Path, title: str = "") -> Optional[Path]:
+    """Erkennt Film-/Serienplakate tolerant nach Namen & prüft Hochformat (Aspect Ratio)"""
+    if not d.exists() or not d.is_dir():
+        return None
 
+    img_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    candidates = []
 
-def backup_old_recordings():
-    """Kopiert alle Tage vor heute nach BACKUP_DIR (nur Neues/Geaendertes) und raeumt dort nach BACKUP_KEEP_DAYS auf."""
-    if not BACKUP_DIR:
-        return
-    if not BACKUP_LOCK.acquire(blocking=False):
-        return
-    copied = 0
     try:
-        if not os.path.isdir(BACKUP_DIR):
-            raise OSError("Backup-Ziel nicht erreichbar")
-        today = datetime.date.today()
-        for day in sorted(d for d in os.listdir(RECORDINGS_DIR) if DATE_RE.match(d) and d < today.isoformat()):
-            src_day = os.path.join(RECORDINGS_DIR, day)
-            for root, _, files in os.walk(src_day):
-                target = os.path.normpath(os.path.join(BACKUP_DIR, day, os.path.relpath(root, src_day)))
-                os.makedirs(target, exist_ok=True)
-                for fname in files:
-                    if fname.endswith((".rec.mp4", ".part")):
-                        continue
-                    src, dst = os.path.join(root, fname), os.path.join(target, fname)
-                    st = os.stat(src)
-                    if os.path.exists(dst):
-                        ds = os.stat(dst)
-                        if ds.st_size == st.st_size and ds.st_mtime >= st.st_mtime - 2:
-                            continue
-                    shutil.copy2(src, dst + ".part")   # erst .part, dann umbenennen: kein halbes File im Backup
-                    os.replace(dst + ".part", dst)
-                    copied += 1
-        if BACKUP_KEEP_DAYS > 0:
-            limit = (today - datetime.timedelta(days=BACKUP_KEEP_DAYS)).isoformat()
-            for day in os.listdir(BACKUP_DIR):
-                if DATE_RE.match(day) and day < limit:
-                    shutil.rmtree(os.path.join(BACKUP_DIR, day), ignore_errors=True)
-        BACKUP_STATE.update(last_run=time.time(), last_error="", files=copied)
-    except Exception as e:
-        BACKUP_STATE.update(last_run=time.time(), last_error=str(e)[:200], files=copied)
-        print(f"[Backup] Fehler: {e}")
-    finally:
-        BACKUP_LOCK.release()
+        for f in d.iterdir():
+            if f.is_file() and f.suffix.lower() in img_exts:
+                candidates.append(f)
+    except Exception:
+        return None
 
+    if not candidates:
+        return None
 
-# ---- MQTT (ohne Zusatzpaket): Bewegung und Online-Status, z.B. fuer Home Assistant -------------
-MQTT_HOST = os.environ.get("MQTT_HOST", "").strip()
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883") or 1883)
-MQTT_USER = os.environ.get("MQTT_USER", "")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
-MQTT_PREFIX = os.environ.get("MQTT_PREFIX", "opencam").strip("/") or "opencam"
-_mqtt_queue = queue.Queue(maxsize=200)
+    title_slug = slugify(title) if title else ""
 
+    # 1. Bevorzuge typische Plakat-Namen
+    for f in candidates:
+        fname = f.stem.lower()
+        if fname in ("poster", "folder", "cover", "front", "default", "show"):
+            return f
+        if "poster" in fname or "cover" in fname or "front" in fname:
+            return f
+        if title_slug and title_slug in slugify(fname):
+            return f
 
-def _mqtt_str(text):
-    raw = text.encode("utf-8")
-    return len(raw).to_bytes(2, "big") + raw
-
-
-def _mqtt_packet(first_byte, body):
-    n, length = len(body), bytearray()
-    while True:
-        digit, n = n % 128, n // 128
-        length.append(digit | (0x80 if n else 0))
-        if not n:
-            break
-    return bytes([first_byte]) + bytes(length) + body
-
-
-def _mqtt_send(topic, payload, retain):
-    flags = 0x02 | (0x80 if MQTT_USER else 0) | (0x40 if MQTT_USER and MQTT_PASSWORD else 0)
-    connect = _mqtt_str("MQTT") + bytes([4, flags]) + (30).to_bytes(2, "big") + _mqtt_str("opencam-" + uuid.uuid4().hex[:8])
-    if MQTT_USER:
-        connect += _mqtt_str(MQTT_USER)
-    if MQTT_USER and MQTT_PASSWORD:
-        connect += _mqtt_str(MQTT_PASSWORD)
-    with socket.create_connection((MQTT_HOST, MQTT_PORT), timeout=5) as sock:
-        sock.sendall(_mqtt_packet(0x10, connect))
-        ack = sock.recv(4)
-        if len(ack) < 4 or ack[0] != 0x20 or ack[3] != 0:
-            raise OSError("MQTT-Verbindung abgelehnt")
-        sock.sendall(_mqtt_packet(0x30 | (1 if retain else 0), _mqtt_str(topic) + payload.encode("utf-8")))
-        sock.sendall(b"\xe0\x00")   # DISCONNECT
-
-
-def _mqtt_worker():
-    while True:
-        topic, payload, retain = _mqtt_queue.get()
+    # 2. Metadaten-Check mit Pillow: Plakate sind Hochformat (Höhe > Breite)
+    portraits = []
+    for f in candidates:
         try:
-            _mqtt_send(topic, payload, retain)
-        except Exception as e:
-            print(f"[MQTT] Fehler: {e}")
-
-
-def mqtt_publish(topic, payload, retain=True):
-    if MQTT_HOST:
-        try:
-            _mqtt_queue.put_nowait((topic, str(payload), retain))
-        except queue.Full:
+            with Image.open(f) as img:
+                w, h = img.size
+                if h > w and (h / max(1, w)) >= 1.15:
+                    portraits.append((h / w, f))
+        except Exception:
             pass
 
+    if portraits:
+        # Sortiere nach bestem Filmplakat-Verhältnis (~1.4 bis 1.5)
+        portraits.sort(key=lambda x: abs(x[0] - 1.48))
+        return portraits[0][1]
 
-if MQTT_HOST:
-    threading.Thread(target=_mqtt_worker, daemon=True).start()
+    # 3. Fallback: Erstes Bild, das kein backdrop / fanart im Namen hat
+    for f in candidates:
+        fname = f.stem.lower()
+        if not any(x in fname for x in ("backdrop", "fanart", "thumb", "banner", "logo", "clearart")):
+            return f
 
-
-def finalize_recording(rec_path):
-    """Wandelt die mp4v-Rohdatei in browserfaehiges H.264 (faststart) um."""
-    final = rec_path[:-len(".rec.mp4")] + ".mp4"
-    part = final + ".part"
-    with TRANSCODE_SEM:
-        try:
-            if not os.path.isfile(rec_path):
-                return
-            st = os.stat(rec_path)
-            cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", rec_path,
-                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
-                   "-an", "-movflags", "+faststart", "-f", "mp4", part]
-            res = subprocess.run(cmd, capture_output=True, timeout=4 * 3600)
-            if res.returncode == 0 and os.path.getsize(part) > 1024:
-                os.utime(part, (st.st_atime, st.st_mtime))  # Endzeit bleibt erhalten
-                os.replace(part, final)
-                os.remove(rec_path)
-                return
-            print(f"[Transcode] ffmpeg Fehler: {res.stderr.decode(errors='ignore')[:300]}")
-        except Exception as e:
-            print(f"[Transcode] Fehler: {e}")
-        try:  # Fallback: Rohdatei behalten, falls sie lesbar ist
-            if os.path.exists(part):
-                os.remove(part)
-            cap = cv2.VideoCapture(rec_path)
-            valid = cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0
-            cap.release()
-            if valid:
-                os.replace(rec_path, final)
-            else:
-                os.remove(rec_path)
-        except Exception as e:
-            print(f"[Transcode] Fallback-Fehler: {e}")
+    return candidates[0]
 
 
-def find_leftovers():
-    found = []
-    try:
-        for day in os.listdir(RECORDINGS_DIR):
-            d = os.path.join(RECORDINGS_DIR, day)
-            if DATE_RE.match(day) and os.path.isdir(d):
-                for root, _, files in os.walk(d):
-                    found += [os.path.join(root, f) for f in files if f.endswith(".rec.mp4")]
-    except Exception as e:
-        print(f"[Recovery] Fehler: {e}")
-    return found
-
-
-def parse_clock(value, default, is_end=False):
-    try:
-        p = [int(x) for x in value.strip().split(":")]
-        return p[0] * 3600 + p[1] * 60 + (p[2] if len(p) > 2 else (59 if is_end else 0))
-    except Exception:
-        return default
-
-
-def camera_folder(day_dir, cam_id, name):
-    """Unterordner pro Kamera: <Name>_<ID>. Bleibt auch nach Umbenennen der Kamera derselbe (Suche ueber die ID)."""
-    cid = re.sub(r"[^a-zA-Z0-9_-]", "_", str(cam_id))
-    try:
-        for d in sorted(os.listdir(day_dir)):
-            if d.endswith("_" + cid) and os.path.isdir(os.path.join(day_dir, d)):
-                return d
-    except OSError:
-        pass
-    base = re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_-]", "_", name or "Cam")).strip("_") or "Cam"
-    return f"{base}_{cid}"
-
-
-def iter_rec_files(day_dir):
-    """(Unterordner, Dateiname) aller Dateien eines Tages: Kamera-Ordner und alte flache Ablage (Unterordner '')."""
-    out = []
-    try:
-        entries = os.listdir(day_dir)
-    except OSError:
-        return out
-    for e in entries:
-        p = os.path.join(day_dir, e)
-        if os.path.isdir(p):
-            if e == "snapshots":
-                continue
-            try:
-                out += [(e, f) for f in os.listdir(p)]
-            except OSError:
-                pass
-        else:
-            out.append(("", e))
-    return out
-
-
-def find_rec_file(date_str, filename):
-    """Pfad einer Aufnahme (Kamera-Ordner oder alte flache Ablage) oder None."""
-    day_dir = os.path.join(RECORDINGS_DIR, date_str)
-    p = os.path.join(day_dir, filename)
-    if os.path.isfile(p):
+def resolve_media_path(raw_path_str: str) -> Path:
+    """Multi-Platten-Mapping: Löst Pfade über ZimaOS-Platten auf (/media/Serien, /media/HDD-Storage)"""
+    raw_str = raw_path_str.replace("\\", "/")
+    p = Path(raw_str)
+    if p.exists():
         return p
+
+    parts = [part for part in p.parts if part not in ("/", "\\", "")]
+    if not parts:
+        return Path("/media")
+
+    media_base = Path("/media")
+    cand_media = media_base.joinpath(*parts)
+    if cand_media.exists() or cand_media.parent.exists():
+        return cand_media
+
+    if media_base.exists():
+        try:
+            for disk in media_base.iterdir():
+                if disk.is_dir():
+                    disk_cand = disk.joinpath(*parts)
+                    if disk_cand.exists() or disk_cand.parent.exists():
+                        return disk_cand
+                    if len(parts) > 1:
+                        disk_cand2 = disk.joinpath(*parts[1:])
+                        if disk_cand2.exists() or disk_cand2.parent.exists():
+                            return disk_cand2
+        except Exception:
+            pass
+
+    target_name = parts[-1].lower()
+    target_slug = slugify(parts[-1])
+    if media_base.exists():
+        try:
+            for root, dirs, _ in os.walk(media_base):
+                for d in dirs:
+                    if d.lower() == target_name or slugify(d) == target_slug:
+                        return Path(root) / d
+                if len(Path(root).relative_to(media_base).parts) >= 4:
+                    dirs.clear()
+        except Exception:
+            pass
+
+    return cand_media
+
+
+def get_jellyfin_headers(api_key: str) -> dict:
+    clean_key = api_key.strip()
+    return {
+        "X-Emby-Token": clean_key,
+        "X-MediaBrowser-Token": clean_key,
+        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="ZimaOS", DeviceId="theme-fetcher-zimaos", Version="1.8.0"',
+        "Accept": "application/json"
+    }
+
+
+def check_jellyfin_has_theme(jf_url: str, api_key: str, jf_raw_id: str) -> Tuple[bool, str]:
+    """Fragt Jellyfin direkt über die API, ob bereits ein ThemeSong hinterlegt ist"""
+    if not jf_url or not api_key or not jf_raw_id:
+        return False, ""
+    headers = get_jellyfin_headers(api_key)
     try:
-        for d in os.listdir(day_dir):
-            p = os.path.join(day_dir, d, filename)
-            if d != "snapshots" and os.path.isfile(p):
-                return p
-    except OSError:
+        r = requests.get(f"{jf_url}/Items/{jf_raw_id}/ThemeSongs", headers=headers, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                t_name = data[0].get("Name") or "Jellyfin Theme"
+                return True, t_name
+            elif isinstance(data, dict):
+                items = data.get("Items", [])
+                if items:
+                    t_name = items[0].get("Name") or "Jellyfin Theme"
+                    return True, t_name
+                if data.get("TotalRecordCount", 0) > 0:
+                    return True, "Jellyfin Theme"
+    except Exception:
         pass
-    return None
+    return False, ""
 
 
-def organize_legacy_recordings():
-    """Einmalig: fertige Aufnahmen aus der alten flachen Ablage in Kamera-Ordner verschieben."""
+
+"""Soundtrack-Spuerhund Integration"""
+import re
+import requests
+
+def discover_soundtrack(title: str, orig: str = "", tmdb_id: str = "") -> dict:
+    info = {"title": "", "composer": "", "source": "", "display": "", "direct_url": ""}
+    # MusicBrainz
+    clean = re.sub(r"[^\w\s]", "", orig or title).strip()
+    headers = {"User-Agent": "ThemeFetcher/1.6.0"}
     try:
-        for day in os.listdir(RECORDINGS_DIR):
-            day_dir = os.path.join(RECORDINGS_DIR, day)
-            if not (DATE_RE.match(day) and os.path.isdir(day_dir)):
-                continue
-            for sub, fname in iter_rec_files(day_dir):
-                if sub or not fname.endswith(".mp4") or fname.endswith(".rec.mp4"):
-                    continue
-                parsed = parse_rec_name(fname[:-4])
-                if not parsed:
-                    continue
-                dst_dir = os.path.join(day_dir, camera_folder(day_dir, parsed[0], parsed[1]))
-                os.makedirs(dst_dir, exist_ok=True)
-                os.replace(os.path.join(day_dir, fname), os.path.join(dst_dir, fname))
-    except Exception as e:
-        print(f"[Archiv] Sortieren nach Kamera: {e}")
+        url = "https://musicbrainz.org/ws/2/release-group"
+        p = {"query": f'releasegroup:"{clean}" AND type:soundtrack', "fmt": "json", "limit": "3"}
+        r = requests.get(url, headers=headers, params=p, timeout=4)
+        if r.status_code == 200:
+            rgs = r.json().get("release-groups", [])
+            if rgs:
+                rg = rgs[0]
+                artists = rg.get("artist-credit", [])
+                c_name = artists[0].get("name", "") if artists else ""
+                info["composer"] = c_name
+                info["title"] = "Soundtrack"
+                info["source"] = "MusicBrainz"
+                info["display"] = f"{c_name} - Soundtrack" if c_name else "Soundtrack"
+                return info
+    except Exception:
+        pass
 
-
-def parse_rec_name(base):
-    """<cam_id>__<Name>__<HH-MM-SS>__<TAG>: Uhrzeit/Tag von rechts lesen, da der Kameraname selbst '__' enthalten kann
-    (z.B. 'TP-Link Tapo Camera (192.168.1.5)')."""
-    m = re.search(r"(\d{2})-(\d{2})-(\d{2})__([A-Za-z0-9]+)$", base)
-    if not m:
-        return None
-    cam_id, sep, name = base[:m.start()].partition("__")
-    if not sep or not cam_id:
-        return None
-    return cam_id, name.strip("_"), int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)), m.group(4)
-
-
-def list_recordings(date_str, cam_filter="", from_sec=0, to_sec=86400):
-    """Aufnahmen eines Tages (aufsteigend). Filter = zeitliche Ueberlappung, nicht nur Startzeit."""
-    day_dir = os.path.join(RECORDINGS_DIR, date_str)
-    if not os.path.isdir(day_dir):
-        return []
-    midnight = datetime.datetime.strptime(date_str, "%Y-%m-%d").timestamp()
-    active = {w.current_filepath for w in list(camera_workers.values()) if w.current_filepath}
-    files = iter_rec_files(day_dir)
-    names = set(files)
-    out = []
-    for sub, fname in files:
-        if not fname.endswith(".mp4"):
-            continue
-        raw = fname.endswith(".rec.mp4")
-        base = fname[:-8] if raw else fname[:-4]
-        if raw and (sub, base + ".mp4") in names:
-            continue
-        parsed = parse_rec_name(base)
-        if not parsed:
-            continue
-        try:
-            fpath = os.path.join(day_dir, sub, fname)
-            st = os.stat(fpath)
-        except OSError:
-            continue
-        rec_cam, rec_name, start, rec_tag = parsed
-        status = ("recording" if fpath in active else "processing") if raw else "ready"
-        end = (time.time() if status == "recording" else st.st_mtime) - midnight
-        end = max(start + 1, min(86400.0, end))
-        if cam_filter and rec_cam != cam_filter:
-            continue
-        if not (start < to_sec and end > from_sec):
-            continue
-        out.append({
-            "date": date_str, "filename": fname, "dir": sub, "camera_id": rec_cam,
-            "camera_name": rec_name.replace("_", " "), "mode": rec_tag,
-            "size_mb": round(st.st_size / (1024 * 1024), 2),
-            "start_sec": start, "end_sec": round(end, 1), "status": status,
-        })
-    out.sort(key=lambda r: r["start_sec"])
-    return out
-
-
-def dir_size(path):
-    total = 0
-    for root, _, files in os.walk(path):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except OSError:
-                pass
-    return total
-
-
-def cleanup_old_recordings():
-    """Loescht nach Alter (retention_days) und danach die aeltesten Tage, bis das GB-Limit eingehalten ist."""
-    if BACKUP_DIR:
-        threading.Thread(target=backup_old_recordings, daemon=True).start()
-    _cleanup_by_age()
+    # Wikidata
     try:
-        settings = load_json(SETTINGS_FILE, {})
-        cap_gb = float(settings.get("max_storage_gb") or os.environ.get("MAX_STORAGE_GB") or 0)
-        if cap_gb <= 0:
-            return
-        today = datetime.date.today().isoformat()
-        total = dir_size(RECORDINGS_DIR)
-        for day in sorted(d for d in os.listdir(RECORDINGS_DIR) if DATE_RE.match(d) and d < today):
-            if total <= cap_gb * 1024 ** 3:
-                break
-            p = os.path.join(RECORDINGS_DIR, day)
-            size = dir_size(p)
-            shutil.rmtree(p, ignore_errors=True)
-            total -= size
-            print(f"[Cleanup] Speicherlimit: {day} geloescht")
-    except Exception as e:
-        print(f"[Cleanup] Limit-Fehler: {e}")
+        w_url = "https://www.wikidata.org/w/api.php"
+        wp = {"action": "wbsearchentities", "search": clean, "language": "de", "format": "json", "limit": "3"}
+        wr = requests.get(w_url, params=wp, timeout=3)
+        if wr.status_code == 200:
+            for ent in wr.json().get("search", []):
+                e_id = ent.get("id")
+                if e_id:
+                    cp = {"action": "wbgetclaims", "entity": e_id, "property": "P86", "format": "json"}
+                    cr = requests.get(w_url, params=cp, timeout=3)
+                    if cr.status_code == 200:
+                        cl = cr.json().get("claims", {}).get("P86", [])
+                        if cl:
+                            comp_id = cl[0].get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id")
+                            if comp_id:
+                                lp = {"action": "wbgetentities", "ids": comp_id, "props": "labels", "languages": "de", "format": "json"}
+                                lr = requests.get(w_url, params=lp, timeout=3)
+                                if lr.status_code == 200:
+                                    lbl = lr.json().get("entities", {}).get(comp_id, {}).get("labels", {}).get("de", {}).get("value")
+                                    if lbl:
+                                        info["composer"] = lbl
+                                        info["title"] = "Titelmusik"
+                                        info["source"] = "Wikidata"
+                                        info["display"] = f"{lbl} - Titelmusik"
+                                        return info
+    except Exception:
+        pass
+
+    return info
 
 
-def _cleanup_by_age():
-    settings = load_json(SETTINGS_FILE, {})
-    retention_days = int(settings.get("retention_days", 7))
-    if retention_days <= 0:
-        return
-    cutoff = datetime.date.today() - datetime.timedelta(days=retention_days)
-    try:
-        for entry in os.listdir(RECORDINGS_DIR):
-            entry_path = os.path.join(RECORDINGS_DIR, entry)
-            if os.path.isdir(entry_path) and re.match(r"^\d{4}-\d{2}-\d{2}$", entry):
-                try:
-                    folder_date = datetime.datetime.strptime(entry, "%Y-%m-%d").date()
-                    if folder_date < cutoff:
-                        shutil.rmtree(entry_path, ignore_errors=True)
-                except ValueError:
-                    pass
-    except Exception as e:
-        print(f"[Cleanup] Fehler: {e}")
+def discover_soundtrack_info(item: dict) -> dict:
+    state = load_state()
+    cache = state.setdefault("soundtrack_cache", {})
+    item_id = item.get("id", "")
+    if item_id in cache:
+        return cache[item_id]
+    info = discover_soundtrack(
+        item.get("title", ""),
+        item.get("original_title", ""),
+        item.get("tmdb_id", "")
+    )
+    cache[item_id] = info
+    save_state(state)
+    return info
 
+def check_item_theme(it: dict, existing: Optional[dict] = None, cfg: Optional[dict] = None) -> Tuple[bool, str, Optional[Path]]:
+    """Tiefensuche: Prüft Festplatten & Jellyfin-API auf vorhandene theme.mp3"""
+    existing = existing or {}
+    candidates = []
 
-# ==============================================================================
-# BENACHRICHTIGUNGEN (NTFY.SH & HOME ASSISTANT WEBHOOK)
-# ==============================================================================
+    if it.get("dir"):
+        candidates.append(Path(it["dir"]))
+        candidates.append(resolve_media_path(it["dir"]))
 
-def trigger_motion_alert(cam_name, cam_id):
-    settings = load_json(SETTINGS_FILE, {})
-    ntfy_url = settings.get("ntfy_url", "").strip()
-    ha_url = settings.get("ha_webhook_url", "").strip()
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if existing.get("dir") and existing.get("dir") != it.get("dir"):
+        candidates.append(Path(existing["dir"]))
+        candidates.append(resolve_media_path(existing["dir"]))
 
-    if ntfy_url:
-        try:
-            requests.post(
-                ntfy_url,
-                data=f"Bewegung erkannt: {cam_name} ({timestamp})".encode("utf-8"),
-                headers={"Title": f"OpenCam Alert: {cam_name}", "Priority": "high"},
-                timeout=4
-            )
-        except Exception as e:
-            print(f"[Alert] ntfy Fehler: {e}")
+    raw_p = it.get("raw_path") or existing.get("raw_path")
+    if raw_p:
+        candidates.append(Path(raw_p))
+        candidates.append(resolve_media_path(raw_p))
 
-    if ha_url:
-        try:
-            requests.post(
-                ha_url,
-                json={"camera_id": cam_id, "camera_name": cam_name, "event": "motion", "timestamp": timestamp},
-                timeout=4
-            )
-        except Exception as e:
-            print(f"[Alert] Home Assistant Webhook Fehler: {e}")
+    item_id = it.get("id") or existing.get("id")
+    if item_id:
+        candidates.append(LOCAL_THEMES_DIR / item_id)
 
+    seen = set()
+    for d in candidates:
+        d_str = str(d)
+        if d_str in seen:
+            continue
+        seen.add(d_str)
 
-# ==============================================================================
-# SINGLE RTSP CONNECTION WORKER (LIVE + MOTION + 24/7 + WATCHDOG)
-# ==============================================================================
-
-class LiveMp4Writer:
-    """Ersatz fuer cv2.VideoWriter: schreibt ueber ffmpeg ein fragmentiertes MP4 (MPEG-4, wie bisher),
-    das schon WAEHREND der Aufnahme lesbar ist (Live-Archiv). Gleiche Schnittstelle wie cv2.VideoWriter.
-    Faellt ffmpeg aus, wird der Grund geloggt und mit dem alten OpenCV-Writer weitergeschrieben."""
-
-    def __init__(self, path, fps, w, h):
-        self.path, self.fps, self.w, self.h = path, fps, w, h
-        self.proc, self.cv, self.err = None, None, None
-        try:
-            self.err = tempfile.TemporaryFile()
-            self.proc = subprocess.Popen(
-                ["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
-                 "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-framerate", f"{fps:.3f}", "-i", "-",
-                 "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-                 "-c:v", "mpeg4", "-q:v", "5", "-g", "15", "-pix_fmt", "yuv420p", "-an",
-                 "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-flush_packets", "1",
-                 "-f", "mp4", path],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.err)
-        except Exception as e:
-            print(f"[Recorder] ffmpeg konnte nicht gestartet werden: {e}")
-            self.proc = None
-
-    def _fallback(self):
-        """ffmpeg-Writer ausgefallen -> Fehler loggen, OpenCV-Writer (ohne Live-Lesbarkeit) verwenden."""
-        if self.cv is not None:
-            return
-        reason = ""
-        try:
-            self.err.seek(0)
-            reason = self.err.read().decode(errors="ignore")[-300:].strip()
-        except Exception:
-            pass
-        print(f"[Recorder] ffmpeg-Writer ausgefallen ({reason or 'unbekannt'}) -> OpenCV-Fallback fuer {os.path.basename(self.path)}")
-        self.proc = None
-        self.cv = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (self.w, self.h))
-
-    def isOpened(self):
-        if self.cv is not None:
-            return self.cv.isOpened()
-        return self.proc is not None and self.proc.poll() is None
-
-    def write(self, frame):
-        if frame.shape[1] != self.w or frame.shape[0] != self.h:
-            return
-        if self.cv is None and (self.proc is None or self.proc.poll() is not None):
-            self._fallback()
-        if self.cv is not None:
-            self.cv.write(frame)
-            return
-        try:
-            self.proc.stdin.write(frame.tobytes())
-        except Exception:
-            pass
-
-    def release(self):
-        if self.cv is not None:
-            self.cv.release()
-            self.cv = None
-        if self.proc is not None:
-            try:
-                self.proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                self.proc.wait(timeout=30)
-            except Exception:
-                self.proc.kill()
-            self.proc = None
-        try:
-            if self.err:
-                self.err.close()
-        except Exception:
-            pass
-
-
-class CameraStreamWorker:
-    def __init__(self, cam_config):
-        self.config = cam_config
-        self.cam_id = cam_config["id"]
-        self.running = True
-        self.lock = threading.Lock()
-        self.latest_jpeg = None
-        self.latest_raw_shape = (720, 1280)
-        self.last_frame_time = time.time()
-        self.connected = False
-        self.motion_detected = False
-        self.last_motion_time = 0
-        self.last_alert_time = 0
-
-        self.writer = None
-        self.current_rec_start = 0
-        self.current_rec_date = ""
-        self.current_rec_mode = ""
-        self.current_filepath = ""
-        self.evt_open = {"motion": False, "offline": False}
-        self.offline_since = 0
-
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
-        self.thread.start()
-
-    def _event(self, kind, active, ts=None, frame=None):
-        if self.evt_open[kind] == active:
-            return
-        self.evt_open[kind] = active
-        name = self.config.get("name", "Camera")
-        extra = {}
-        if kind == "motion" and active and frame is not None:
-            snap = save_snapshot(self.cam_id, frame)
-            if snap:
-                extra["snap"] = snap
-        log_event(self.cam_id, name, f"{kind}_{'start' if active else 'end'}", ts, extra)
-        topic = f"{MQTT_PREFIX}/{re.sub(r'[^a-zA-Z0-9_-]', '_', name)}"
-        if kind == "motion":
-            mqtt_publish(f"{topic}/motion", "ON" if active else "OFF")
-        elif kind == "offline":
-            mqtt_publish(f"{topic}/online", "OFF" if active else "ON")
-
-    def _close_events(self):
-        for kind in ("motion", "offline"):
-            self._event(kind, False)
-
-    def update_config(self, new_config):
-        with self.lock:
-            rtsp_changed = self.config.get("rtsp_url") != new_config.get("rtsp_url")
-            self.config = new_config
-            if rtsp_changed:
-                self.last_frame_time = 0
-
-    def stop(self):
-        self.running = False
-        self._close_writer()
-        self._close_events()
-
-    def get_jpeg(self):
-        with self.lock:
-            if self.latest_jpeg is not None:
-                return self.latest_jpeg
-        return self._generate_placeholder_jpeg("Verbinde Kamera...")
-
-    def _generate_placeholder_jpeg(self, text):
-        img = np.zeros((480, 854, 3), dtype=np.uint8)
-        img[:] = (22, 24, 29)
-        cv2.putText(img, self.config.get("name", "Camera"), (30, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (220, 220, 220), 2)
-        cv2.putText(img, text, (30, 240),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (140, 150, 165), 2)
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(img, ts, (30, 440),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 110, 120), 1)
-        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        return buf.tobytes() if ok else b""
-
-    def _apply_privacy_zones(self, frame, privacy_zones):
-        if not privacy_zones:
-            return
-        h, w = frame.shape[:2]
-        for z in privacy_zones:
-            try:
-                x1 = max(0, int(float(z["x"]) * w))
-                y1 = max(0, int(float(z["y"]) * h))
-                x2 = min(w, int((float(z["x"]) + float(z["w"])) * w))
-                y2 = min(h, int((float(z["y"]) + float(z["h"])) * h))
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
-            except Exception:
-                pass
-
-    def _detect_motion(self, prev_gray, curr_gray, motion_zones, sensitivity):
-        if prev_gray is None or prev_gray.shape != curr_gray.shape:
-            return False
-        diff = cv2.absdiff(prev_gray, curr_gray)
-        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-
-        h, w = thresh.shape[:2]
-        area = float(h * w)
-        if motion_zones:
-            mask = np.zeros((h, w), dtype=np.uint8)
-            for z in motion_zones:
-                try:
-                    x1 = max(0, int(float(z["x"]) * w))
-                    y1 = max(0, int(float(z["y"]) * h))
-                    x2 = min(w, int((float(z["x"]) + float(z["w"])) * w))
-                    y2 = min(h, int((float(z["y"]) + float(z["h"])) * h))
-                    cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
-                except Exception:
-                    pass
-            thresh = cv2.bitwise_and(thresh, mask)
-            area = float(max(1, cv2.countNonZero(mask)))   # Zonenflaeche, nicht das ganze Bild
-
-        changed_pixels = cv2.countNonZero(thresh)
-        total_pixels = area
-        sens = max(1, min(100, int(sensitivity or 50)))
-        required_ratio = 0.05 * ((101 - sens) / 100.0) * 0.5 + 0.0005
-        return (changed_pixels / total_pixels) >= required_ratio
-
-    def _close_writer(self):
-        if self.writer is not None:
-            try:
-                self.writer.release()
-            except Exception:
-                pass
-            self.writer = None
-            path, self.current_filepath = self.current_filepath, ""
-            if path:
-                threading.Thread(target=finalize_recording, args=(path,), daemon=True).start()
-
-    def _handle_recording(self, frame, fps):
-        settings = load_json(SETTINGS_FILE, {})
-        interval_min = int(settings.get("recording_interval", 15))
-        interval_min = max(15, min(120, interval_min))
-        interval_sec = interval_min * 60
-        post_buffer = int(settings.get("motion_post_buffer", 15))
-
-        mode = self.config.get("recording_mode", "live")
-        if mode == "live" and self.config.get("motion_zones"):
-            mode = "motion"   # Live + eingerichtete Bewegungszonen: nur bei Bewegung in den Zonen aufnehmen
-        now = time.time()
-        dt_now = datetime.datetime.now()
-        today_str = dt_now.strftime("%Y-%m-%d")
-
-        should_record = False
-        if mode == "24/7":
-            should_record = True
-        elif mode == "motion":
-            if self.motion_detected or (now - self.last_motion_time <= post_buffer):
-                should_record = True
-
-        if not should_record:
-            self._close_writer()
-            return
-
-        if (
-            self.writer is None
-            or self.current_rec_date != today_str
-            or (now - self.current_rec_start) >= interval_sec
-        ):
-            self._close_writer()
-            ensure_daily_folders()
-            day_folder = os.path.join(RECORDINGS_DIR, today_str)
-            os.makedirs(day_folder, exist_ok=True)
-
-            safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", self.config.get("name", "Cam"))
-            time_str = dt_now.strftime("%H-%M-%S")
-            tag = "MOTION" if mode == "motion" else "24x7"
-            filename = f"{self.cam_id}__{safe_name}__{time_str}__{tag}.rec.mp4"
-            cam_dir = os.path.join(day_folder, camera_folder(day_folder, self.cam_id, safe_name))
-            os.makedirs(cam_dir, exist_ok=True)
-            filepath = os.path.join(cam_dir, filename)
-
-            h, w = frame.shape[:2]
-            out_fps = max(5.0, min(30.0, float(fps if fps and fps > 0 else 15.0)))
-            self.writer = LiveMp4Writer(filepath, out_fps, w, h)
-            self.current_rec_start = now
-            self.current_rec_date = today_str
-            self.current_rec_mode = mode
-            self.current_filepath = filepath
-
-        if self.writer is not None and self.writer.isOpened():
-            self.writer.write(frame)
-
-    def _run_loop(self):
-        cap = None
-        prev_gray = None
-        fps_estimate = 15.0
-
-        while self.running:
-            rtsp_url = self.config.get("rtsp_url", "").strip()
-            if not rtsp_url:
-                self.connected = False
-                with self.lock:
-                    self.latest_jpeg = self._generate_placeholder_jpeg("Keine RTSP-URL konfiguriert")
-                time.sleep(2)
-                continue
-
-            if cap is None or not cap.isOpened() or (time.time() - self.last_frame_time > 25.0):
-                self.connected = False
-                if not self.offline_since:
-                    self.offline_since = time.time()
-                if time.time() - self.offline_since > 10:
-                    self._event("offline", True, self.offline_since)
-                self._close_writer()
-                if cap is not None:
+        theme_file = find_theme_file_in_dir(d)
+        if theme_file:
+            if theme_file.name.lower() != "theme.mp3":
+                standard_mp3 = d / "theme.mp3"
+                if not standard_mp3.exists():
                     try:
-                        cap.release()
+                        shutil.copy2(theme_file, standard_mp3)
+                        theme_file = standard_mp3
                     except Exception:
                         pass
-                with self.lock:
-                    self.latest_jpeg = self._generate_placeholder_jpeg("Verbinde Stream (Watchdog)...")
-                try:
-                    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
-                    cap = None
-                if cap is None or not cap.isOpened():
-                    time.sleep(3)
-                    continue
-                self.last_frame_time = time.time()
-                prev_gray = None
+            it["dir"] = d_str
+            return True, d_str, theme_file
 
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                time.sleep(0.1)
-                continue
-
-            now = time.time()
-            self.last_frame_time = now
-            self.connected = True
-            self.offline_since = 0
-            self._event("offline", False)
-            self.latest_raw_shape = frame.shape[:2]
-
-            cam_fps = cap.get(cv2.CAP_PROP_FPS)
-            if cam_fps and 1.0 <= cam_fps <= 60.0:
-                fps_estimate = cam_fps
-
-            with self.lock:
-                privacy_zones = list(self.config.get("privacy_zones", []))
-                motion_zones = list(self.config.get("motion_zones", []))
-                sensitivity = self.config.get("motion_sensitivity", 50)
-                cam_name = self.config.get("name", "Camera")
-
-            self._apply_privacy_zones(frame, privacy_zones)
-
-            small = cv2.resize(frame, (320, 180))
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (9, 9), 0)
-
-            is_moving = self._detect_motion(prev_gray, gray, motion_zones, sensitivity)
-            prev_gray = gray
-            self.motion_detected = is_moving
-
-            if is_moving:
-                self.last_motion_time = now
-                settings = load_json(SETTINGS_FILE, {})
-                cooldown = int(settings.get("alert_cooldown", 60))
-                if now - self.last_alert_time >= cooldown:
-                    self.last_alert_time = now
-                    threading.Thread(
-                        target=trigger_motion_alert,
-                        args=(cam_name, self.cam_id),
-                        daemon=True
-                    ).start()
-
-            if is_moving:
-                self._event("motion", True, frame=frame)
-            elif self.evt_open["motion"] and now - self.last_motion_time > 5:
-                self._event("motion", False)
-
-            try:
-                self._handle_recording(frame, fps_estimate)
-            except Exception as e:
-                print(f"[Recording] Fehler bei {cam_name}: {e}")
-
-            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if ok:
-                with self.lock:
-                    self.latest_jpeg = buffer.tobytes()
-
-        self._close_writer()
-        self._close_events()
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                pass
-
-
-def sync_camera_workers():
-    cameras = load_json(CAMERAS_FILE, [])
-    active_ids = set()
-    with workers_lock:
-        for cam in cameras:
-            cid = cam["id"]
-            active_ids.add(cid)
-            if cid in camera_workers:
-                camera_workers[cid].update_config(cam)
-            else:
-                camera_workers[cid] = CameraStreamWorker(cam)
-
-        for cid in list(camera_workers.keys()):
-            if cid not in active_ids:
-                camera_workers[cid].stop()
-                del camera_workers[cid]
-
-
-def background_housekeeping():
-    while True:
+    # Rekursive Suche im gesamten /media Mount nach Ordnername (z. B. Die Dinos)
+    title_raw = it.get("title", "").strip().lower()
+    title_slug = slugify(title_raw)
+    media_base = Path("/media")
+    if media_base.exists() and len(title_slug) >= 2:
         try:
-            ensure_daily_folders()
-            cleanup_old_recordings()
-            check_for_updates(force=False)
-        except Exception as e:
-            print(f"[Housekeeping] Fehler: {e}")
-        time.sleep(900)
-
-
-print("[OpenCam] Live-Archiv aktiv (laufende Aufnahmen sind abspielbar)")
-_leftovers = find_leftovers()
-threading.Thread(target=lambda: ([finalize_recording(p) for p in _leftovers], organize_legacy_recordings()), daemon=True).start()
-sync_camera_workers()
-threading.Thread(target=background_housekeeping, daemon=True).start()
-
-
-# ==============================================================================
-# HYBRID ONVIF SCANNER (AB .2 BIS .254)
-# ==============================================================================
-
-def get_local_subnet_prefix():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        parts = ip.split(".")
-        if len(parts) == 4 and not ip.startswith("172.17."):
-            return f"{parts[0]}.{parts[1]}.{parts[2]}"
-    except Exception:
-        pass
-    return "192.168.178"
-
-
-def is_router_ip(ip_str):
-    parts = ip_str.strip().split(".")
-    if len(parts) != 4:
-        return True
-    try:
-        last_octet = int(parts[3])
-        return last_octet < 2 or last_octet > 254
-    except ValueError:
-        return True
-
-
-def ws_discovery_scan(timeout=2.0):
-    discovered_ips = set()
-    probe_id = str(uuid.uuid4())
-    probe_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-    <e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
-                xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
-                xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
-        <e:Header>
-            <w:MessageID>uuid:{probe_id}</w:MessageID>
-            <w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005/04/discovery</w:To>
-            <w:Action a:mustUnderstand="true" xmlns:a="http://www.w3.org/2005/08/addressing">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
-        </e:Header>
-        <e:Body>
-            <d:Probe>
-                <d:Types>dn:NetworkVideoTransmitter</d:Types>
-            </d:Probe>
-        </e:Body>
-    </e:Envelope>"""
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.settimeout(timeout)
-    try:
-        sock.sendto(probe_xml.encode("utf-8"), ("239.255.255.250", 3702))
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                data, addr = sock.recvfrom(65535)
-                sender_ip = addr[0]
-                if not is_router_ip(sender_ip):
-                    discovered_ips.add(sender_ip)
-                text = data.decode("utf-8", errors="ignore")
-                for match in re.findall(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", text):
-                    if not is_router_ip(match):
-                        discovered_ips.add(match)
-            except socket.timeout:
-                break
-            except Exception:
-                break
-    except Exception:
-        pass
-    finally:
-        sock.close()
-    return discovered_ips
-
-
-def probe_host_ports(ip):
-    if is_router_ip(ip):
-        return None
-
-    ports_to_check = [554, 2020, 8000, 8899, 8554]
-    open_ports = []
-    for port in ports_to_check:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.35)
-        try:
-            if s.connect_ex((ip, port)) == 0:
-                open_ports.append(port)
+            for root, dirs, _ in os.walk(media_base):
+                for d in dirs:
+                    d_lower = d.lower()
+                    d_slug = slugify(d)
+                    if d_lower == title_raw or d_slug == title_slug or (len(title_slug) > 4 and (title_slug in d_slug or d_slug in title_slug)):
+                        cand_dir = Path(root) / d
+                        theme_file = find_theme_file_in_dir(cand_dir)
+                        if theme_file:
+                            it["dir"] = str(cand_dir)
+                            return True, str(cand_dir), theme_file
+                        it["dir"] = str(cand_dir)
+                if len(Path(root).relative_to(media_base).parts) >= 4:
+                    dirs.clear()
         except Exception:
             pass
-        finally:
-            s.close()
 
-    if not open_ports:
+    # Doppelter Boden: Prüfe direkt über Jellyfin API
+    if cfg and it.get("source") == "Jellyfin" and it.get("jf_raw_id") and cfg.get("jellyfin_url"):
+        has_jf_theme, t_name = check_jellyfin_has_theme(cfg["jellyfin_url"], cfg.get("jellyfin_api_key", ""), it["jf_raw_id"])
+        if has_jf_theme:
+            default_dir = str(it.get("dir") or (candidates[0] if candidates else "/media"))
+            it["video_title"] = t_name
+            return True, default_dir, None
+
+    default_dir = str(it.get("dir") or (candidates[0] if candidates else (str(LOCAL_THEMES_DIR / item_id) if item_id else "/media")))
+    return False, default_dir, None
+
+
+def find_jellyfin_boxset_dir(title: str, jf_meta_base: str) -> Optional[Path]:
+    base = Path(jf_meta_base)
+    if not base.exists():
         return None
-
-    brand = "generic"
-    onvif_port = 80
-    rtsp_path = "/stream1"
-    label = "ONVIF / RTSP Camera"
-
-    if 2020 in open_ports:
-        brand = "tapo"
-        onvif_port = 2020
-        rtsp_path = "/stream1"
-        label = "TP-Link Tapo Camera"
-    elif 8000 in open_ports:
-        brand = "hikvision"
-        onvif_port = 80
-        rtsp_path = "/Streaming/Channels/101"
-        label = "Hikvision Camera"
-    elif 8899 in open_ports:
-        brand = "onvif"
-        onvif_port = 8899
-        rtsp_path = "/live/ch0"
-        label = "ONVIF Camera"
-
-    return {
-        "ip": ip,
-        "brand": brand,
-        "name": f"{label} ({ip})",
-        "open_ports": open_ports,
-        "onvif_port": onvif_port,
-        "suggested_rtsp": f"rtsp://admin:password@{ip}:554{rtsp_path}"
-    }
-
-
-def hybrid_network_scan(subnet_prefix=None):
-    if not subnet_prefix or not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$", subnet_prefix.strip()):
-        subnet_prefix = get_local_subnet_prefix()
-    subnet_prefix = subnet_prefix.strip()
-
-    ws_ips = ws_discovery_scan(timeout=1.5)
-    target_ips = [f"{subnet_prefix}.{i}" for i in range(2, 255)]
-    for wip in ws_ips:
-        if not is_router_ip(wip) and wip not in target_ips:
-            target_ips.append(wip)
-
-    results = []
-    with ThreadPoolExecutor(max_workers=64) as executor:
-        futures = {executor.submit(probe_host_ports, ip): ip for ip in target_ips}
-        for future in as_completed(futures):
-            res = future.result()
-            if res is not None:
-                results.append(res)
-
-    results.sort(key=lambda x: [int(p) for p in x["ip"].split(".")])
-    return results
-
-
-# ==============================================================================
-# SIGNED TAPO & ONVIF PTZ
-# ==============================================================================
-
-def build_wsse_header(username, password):
-    nonce_raw = os.urandom(16)
-    created = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    digest = hashlib.sha1(nonce_raw + created.encode("utf-8") + password.encode("utf-8")).digest()
-    password_digest = base64.b64encode(digest).decode("utf-8")
-    nonce_b64 = base64.b64encode(nonce_raw).decode("utf-8")
-
-    return f"""
-    <s:Header>
-        <Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <UsernameToken>
-                <Username>{username}</Username>
-                <Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{password_digest}</Password>
-                <Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce_b64}</Nonce>
-                <Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{created}</Created>
-            </UsernameToken>
-        </Security>
-    </s:Header>"""
-
-
-def execute_onvif_ptz(cam, direction, speed=0.5):
-    ip = cam.get("ip", "").strip()
-    port = int(cam.get("onvif_port", 2020) or 2020)
-    user = cam.get("username", "admin")
-    password = cam.get("password", "")
-    profile_token = cam.get("profile_token", "profile_1")
-
-    if not ip:
-        return False, "Keine Kamera-IP hinterlegt"
-
-    vx, vy, vz = 0.0, 0.0, 0.0
-    if direction == "left":
-        vx = -speed
-    elif direction == "right":
-        vx = speed
-    elif direction == "up":
-        vy = speed
-    elif direction == "down":
-        vy = -speed
-    elif direction == "zoom_in":
-        vz = speed
-    elif direction == "zoom_out":
-        vz = -speed
-
-    wsse = build_wsse_header(user, password)
-
-    if direction == "stop":
-        body = f"""
-        <s:Body xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-            <Stop xmlns="http://www.onvif.org/ver20/ptz/wsdl">
-                <ProfileToken>{profile_token}</ProfileToken>
-                <PanTilt>true</PanTilt>
-                <Zoom>true</Zoom>
-            </Stop>
-        </s:Body>"""
-    else:
-        body = f"""
-        <s:Body xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-            <ContinuousMove xmlns="http://www.onvif.org/ver20/ptz/wsdl">
-                <ProfileToken>{profile_token}</ProfileToken>
-                <Velocity>
-                    <PanTilt x="{vx}" y="{vy}" xmlns="http://www.onvif.org/ver10/schema"/>
-                    <Zoom x="{vz}" xmlns="http://www.onvif.org/ver10/schema"/>
-                </Velocity>
-            </ContinuousMove>
-        </s:Body>"""
-
-    envelope = f'<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">{wsse}{body}</s:Envelope>'
-    endpoints = [
-        f"http://{ip}:{port}/onvif/ptz_service",
-        f"http://{ip}:{port}/onvif/device_service",
-        f"http://{ip}:2020/onvif/ptz_service"
-    ]
-
-    for url in endpoints:
-        try:
-            resp = requests.post(
-                url,
-                data=envelope.encode("utf-8"),
-                headers={"Content-Type": "application/soap+xml; charset=utf-8"},
-                timeout=2.5
-            )
-            if resp.status_code < 400:
-                if direction != "stop":
-                    threading.Timer(0.45, execute_onvif_ptz, args=(cam, "stop", 0)).start()
-                return True, "OK"
-        except Exception:
-            continue
-
-    return False, "PTZ-Endpunkt antwortet nicht"
-
-
-# ==============================================================================
-# AUTHENTIFIZIERUNG & ROLLEN
-# ==============================================================================
-
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user" not in session:
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "Nicht angemeldet"}), 401
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return decorated
-
-
-def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user" not in session:
-            return jsonify({"error": "Nicht angemeldet"}), 401
-        if session.get("role") != "admin":
-            return jsonify({"error": "Keine Berechtigung (Nur für Administratoren)"}), 403
-        return f(*args, **kwargs)
-    return decorated
-
-
-LOGIN_FAILS = {}
-LOGIN_LOCK = threading.Lock()
-_STATUS_CACHE = {"t": 0.0, "size": 0}
-
-
-@app.route("/healthz")
-def healthz():
-    return jsonify({"ok": True})
-
-
-@app.route("/api/status")
-@admin_required
-def api_status():
-    if time.time() - _STATUS_CACHE["t"] > 60:   # Ordnergroesse nur einmal pro Minute berechnen
-        _STATUS_CACHE.update(t=time.time(), size=dir_size(RECORDINGS_DIR))
-    usage = shutil.disk_usage(RECORDINGS_DIR)
-    settings = load_json(SETTINGS_FILE, {})
-    return jsonify({
-        "disk_total": usage.total, "disk_free": usage.free, "recordings_bytes": _STATUS_CACHE["size"],
-        "max_storage_gb": float(settings.get("max_storage_gb") or os.environ.get("MAX_STORAGE_GB") or 0),
-        "retention_days": int(settings.get("retention_days", 7)),
-        "backup": {"enabled": bool(BACKUP_DIR), **BACKUP_STATE},
-        "mqtt": bool(MQTT_HOST),
-        "live_archive": True   # Marker: Live-Archiv-Version laeuft
-    })
-
-
-def login_blocked(ip):
-    now = time.time()
-    with LOGIN_LOCK:
-        LOGIN_FAILS[ip] = [t for t in LOGIN_FAILS.get(ip, []) if now - t < 600]
-        return len(LOGIN_FAILS[ip]) >= 5
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error = None
-    settings = load_json(SETTINGS_FILE, {})
-    lang = settings.get("language", "de")
-
-    if request.method == "POST":
-        username = (request.form.get("username") or "").strip()
-        password = request.form.get("password") or ""
-        users = load_json(USERS_FILE, {})
-        ip = request.remote_addr or "?"
-
-        if login_blocked(ip):
-            error = "Zu viele Fehlversuche, bitte 10 Minuten warten / Too many attempts, please wait 10 minutes"
-            return render_template("login.html", error=error, lang=lang, version=APP_VERSION), 429
-
-        if username in users and check_password_hash(users[username]["password_hash"], password):
-            LOGIN_FAILS.pop(ip, None)
-            session["user"] = username
-            session["role"] = users[username].get("role", "readonly")
-            return redirect(url_for("index"))
-        with LOGIN_LOCK:
-            LOGIN_FAILS.setdefault(ip, []).append(time.time())
-        error = "Ungültiger Benutzername oder Passwort / Invalid credentials"
-
-    return render_template("login.html", error=error, lang=lang, version=APP_VERSION)
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
-@app.route("/")
-@login_required
-def index():
-    return render_template(
-        "index.html",
-        username=session.get("user"),
-        role=session.get("role", "readonly"),
-        version=APP_VERSION
-    )
-
-
-# ==============================================================================
-# API: BOOTSTRAP, UPDATE-CHECK, KAMERAS & EINSTELLUNGEN
-# ==============================================================================
-
-@app.route("/api/bootstrap", methods=["GET"])
-@login_required
-def api_bootstrap():
-    role = session.get("role", "readonly")
-    settings = load_json(SETTINGS_FILE, {})
-    cameras = load_json(CAMERAS_FILE, [])
-    upd = check_for_updates(force=False) if role == "admin" else {}
-
-    safe_cameras = []
-    for c in cameras:
-        with workers_lock:
-            w = camera_workers.get(c["id"])
-            online = w.connected if w else False
-            motion = w.motion_detected if w else False
-
-        if role == "admin":
-            cam_copy = dict(c)
-        else:
-            cam_copy = {
-                "id": c["id"],
-                "name": c.get("name", "Camera"),
-                "recording_mode": c.get("recording_mode", "live"),
-                "ptz_enabled": False
-            }
-        cam_copy["online"] = online
-        cam_copy["motion"] = motion
-        safe_cameras.append(cam_copy)
-
-    return jsonify({
-        "version": APP_VERSION,
-        "update_info": upd,
-        "user": session.get("user"),
-        "role": role,
-        "settings": settings if role == "admin" else {"language": settings.get("language", "de")},
-        "cameras": safe_cameras,
-        "detected_subnet": get_local_subnet_prefix()
-    })
-
-
-@app.route("/api/update_check", methods=["GET"])
-@admin_required
-def api_update_check():
-    upd = check_for_updates(force=True)
-    return jsonify({
-        "current_version": APP_VERSION,
-        "latest_version": upd.get("latest_version", APP_VERSION),
-        "update_available": upd.get("update_available", False),
-        "repo_url": upd.get("repo_url", f"https://github.com/{GITHUB_REPO}")
-    })
-
-
-@app.route("/api/cameras", methods=["GET", "POST"])
-@login_required
-def api_cameras():
-    if request.method == "GET":
-        if session.get("role") != "admin":
-            return jsonify({"error": "Forbidden"}), 403
-        return jsonify(load_json(CAMERAS_FILE, []))
-
-    if session.get("role") != "admin":
-        return jsonify({"error": "Keine Berechtigung"}), 403
-
-    data = request.json or {}
-    cameras = load_json(CAMERAS_FILE, [])
-    cam_id = data.get("id") or str(uuid.uuid4())[:8]
-
-    ip = (data.get("ip") or "").strip()
-    user = (data.get("username") or "admin").strip()
-    password = data.get("password") or ""
-    brand = data.get("brand") or "tapo"
-    rtsp_url = (data.get("rtsp_url") or "").strip()
-
-    if not rtsp_url and ip:
-        if brand == "tapo":
-            rtsp_url = f"rtsp://{user}:{password}@{ip}:554/stream1"
-        elif brand == "hikvision":
-            rtsp_url = f"rtsp://{user}:{password}@{ip}:554/Streaming/Channels/101"
-        elif brand == "reolink":
-            rtsp_url = f"rtsp://{user}:{password}@{ip}:554/h264Preview_01_main"
-        else:
-            rtsp_url = f"rtsp://{user}:{password}@{ip}:554/stream1"
-
-    rec_mode = data.get("recording_mode", "live")
-    if rec_mode not in ("live", "motion", "24/7"):
-        rec_mode = "live"
-
-    existing = next((c for c in cameras if c["id"] == cam_id), None)
-    cam_obj = {
-        "id": cam_id,
-        "name": (data.get("name") or f"Kamera {ip}").strip(),
-        "brand": brand,
-        "ip": ip,
-        "onvif_port": int(data.get("onvif_port") or (2020 if brand == "tapo" else 80)),
-        "username": user,
-        "password": password,
-        "rtsp_url": rtsp_url,
-        "recording_mode": rec_mode,
-        "ptz_enabled": bool(data.get("ptz_enabled", True)),
-        "motion_sensitivity": int(data.get("motion_sensitivity", existing.get("motion_sensitivity", 50) if existing else 50)),
-        "privacy_zones": clean_zones(data.get("privacy_zones", existing.get("privacy_zones", []) if existing else [])),
-        "motion_zones": clean_zones(data.get("motion_zones", existing.get("motion_zones", []) if existing else []))
-    }
-
-    if existing:
-        idx = cameras.index(existing)
-        cameras[idx] = cam_obj
-    else:
-        cameras.append(cam_obj)
-
-    save_json(CAMERAS_FILE, cameras)
-    sync_camera_workers()
-    return jsonify({"status": "ok", "camera": cam_obj})
-
-
-@app.route("/api/cameras/<cam_id>", methods=["DELETE"])
-@admin_required
-def api_delete_camera(cam_id):
-    cameras = load_json(CAMERAS_FILE, [])
-    cameras = [c for c in cameras if c["id"] != cam_id]
-    save_json(CAMERAS_FILE, cameras)
-    sync_camera_workers()
-    return jsonify({"status": "ok"})
-
-
-@app.route("/api/cameras/<cam_id>/mode", methods=["POST"])
-@admin_required
-def api_camera_mode(cam_id):
-    data = request.json or {}
-    mode = data.get("recording_mode", "live")
-    if mode not in ("live", "motion", "24/7"):
-        return jsonify({"error": "Ungültiger Modus"}), 400
-
-    cameras = load_json(CAMERAS_FILE, [])
-    for c in cameras:
-        if c["id"] == cam_id:
-            c["recording_mode"] = mode
-            break
-    save_json(CAMERAS_FILE, cameras)
-    sync_camera_workers()
-    return jsonify({"status": "ok", "recording_mode": mode})
-
-
-def clean_zones(zones):
-    """Nur gueltige Rechtecke (0..1, relativ zum Bild) behalten."""
-    out = []
-    for z in (zones if isinstance(zones, list) else [])[:50]:
-        try:
-            x = min(1.0, max(0.0, float(z["x"])))
-            y = min(1.0, max(0.0, float(z["y"])))
-            w = min(1.0 - x, max(0.0, float(z["w"])))
-            h = min(1.0 - y, max(0.0, float(z["h"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if w > 0.005 and h > 0.005:
-            out.append({"x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4)})
-    return out
-
-
-@app.route("/api/live-status")
-@login_required
-def api_live_status():
-    out = {}
-    with workers_lock:
-        for cid, w in camera_workers.items():
-            out[cid] = {"online": bool(w.connected), "motion": bool(w.motion_detected), "recording": w.writer is not None}
-    return jsonify(out)
-
-
-@app.route("/api/cameras/<cam_id>/zones", methods=["POST"])
-@admin_required
-def api_camera_zones(cam_id):
-    data = request.json or {}
-    cameras = load_json(CAMERAS_FILE, [])
-    for c in cameras:
-        if c["id"] == cam_id:
-            if "privacy_zones" in data:
-                c["privacy_zones"] = clean_zones(data["privacy_zones"])
-            if "motion_zones" in data:
-                c["motion_zones"] = clean_zones(data["motion_zones"])
-            if "motion_sensitivity" in data:
-                try:
-                    c["motion_sensitivity"] = max(1, min(100, int(data["motion_sensitivity"])))
-                except (TypeError, ValueError):
-                    pass
-            break
-    save_json(CAMERAS_FILE, cameras)
-    sync_camera_workers()
-    return jsonify({"status": "ok"})
-
-
-@app.route("/api/scan", methods=["POST"])
-@admin_required
-def api_scan_network():
-    data = request.json or {}
-    subnet = data.get("subnet", "").strip()
-    found = hybrid_network_scan(subnet_prefix=subnet)
-    return jsonify({"found": found, "subnet": subnet or get_local_subnet_prefix()})
-
-
-@app.route("/api/ptz/<cam_id>", methods=["POST"])
-@admin_required
-def api_ptz(cam_id):
-    data = request.json or {}
-    direction = data.get("direction", "stop")
-    cameras = load_json(CAMERAS_FILE, [])
-    cam = next((c for c in cameras if c["id"] == cam_id), None)
-    if not cam:
-        return jsonify({"error": "Kamera nicht gefunden"}), 404
-    ok, msg = execute_onvif_ptz(cam, direction)
-    return jsonify({"status": "ok" if ok else "error", "message": msg})
-
-
-@app.route("/api/settings", methods=["POST"])
-@admin_required
-def api_save_settings():
-    data = request.json or {}
-    settings = load_json(SETTINGS_FILE, {})
-
-    if "language" in data and data["language"] in ("en", "de", "fr", "es"):
-        settings["language"] = data["language"]
-
-    if "recording_interval" in data:
-        val = int(data["recording_interval"])
-        if val in (15, 30, 45, 60, 75, 90, 105, 120):
-            settings["recording_interval"] = val
-        else:
-            settings["recording_interval"] = max(15, min(120, val))
-
-    if "retention_days" in data:
-        settings["retention_days"] = max(1, min(365, int(data["retention_days"])))
-    if "motion_post_buffer" in data:
-        settings["motion_post_buffer"] = max(5, min(300, int(data["motion_post_buffer"])))
-    if "ntfy_url" in data:
-        settings["ntfy_url"] = data["ntfy_url"].strip()
-    if "ha_webhook_url" in data:
-        settings["ha_webhook_url"] = data["ha_webhook_url"].strip()
-    if "github_repo" in data and data["github_repo"].strip():
-        settings["github_repo"] = data["github_repo"].strip()
-
-    save_json(SETTINGS_FILE, settings)
-    check_for_updates(force=True)
-    return jsonify({"status": "ok", "settings": settings})
-
-
-# ==============================================================================
-# API: BENUTZERVERWALTUNG (ADMIN & READONLY)
-# ==============================================================================
-
-@app.route("/api/users", methods=["GET", "POST"])
-@admin_required
-def api_users():
-    users = load_json(USERS_FILE, {})
-    if request.method == "GET":
-        result = [
-            {"username": u, "role": info.get("role", "readonly"), "created_at": info.get("created_at", "")}
-            for u, info in users.items()
-        ]
-        return jsonify(result)
-
-    data = request.json or {}
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
-    role = data.get("role", "readonly")
-
-    if not username or not password:
-        return jsonify({"error": "Benutzername und Passwort erforderlich"}), 400
-    if role not in ("admin", "readonly"):
-        role = "readonly"
-
-    users[username] = {
-        "password_hash": generate_password_hash(password),
-        "role": role,
-        "created_at": datetime.datetime.now().isoformat()
-    }
-    save_json(USERS_FILE, users)
-    return jsonify({"status": "ok"})
-
-
-@app.route("/api/users/<username>", methods=["DELETE"])
-@admin_required
-def api_delete_user(username):
-    users = load_json(USERS_FILE, {})
-    if username not in users:
-        return jsonify({"error": "Benutzer nicht gefunden"}), 404
-
-    admin_count = sum(1 for u, info in users.items() if info.get("role") == "admin")
-    if users[username].get("role") == "admin" and admin_count <= 1:
-        return jsonify({"error": "Der letzte Administrator kann nicht gelöscht werden"}), 400
-
-    del users[username]
-    save_json(USERS_FILE, users)
-    return jsonify({"status": "ok"})
-
-
-# ==============================================================================
-# API: LIVE STREAM & SNAPSHOT
-# ==============================================================================
-
-def generate_mjpeg(cam_id):
-    while True:
-        with workers_lock:
-            worker = camera_workers.get(cam_id)
-        if worker is None:
-            break
-        jpg = worker.get_jpeg()
-        if jpg:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            )
-        time.sleep(0.08)
-
-
-@app.route("/api/stream/<cam_id>")
-@login_required
-def api_stream(cam_id):
-    return Response(
-        generate_mjpeg(cam_id),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
-
-
-@app.route("/api/snapshot/<cam_id>")
-@login_required
-def api_snapshot(cam_id):
-    with workers_lock:
-        worker = camera_workers.get(cam_id)
-    if not worker:
-        abort(404)
-    jpg = worker.get_jpeg()
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Response(
-        jpg,
-        mimetype="image/jpeg",
-        headers={"Content-Disposition": f'attachment; filename="snapshot_{cam_id}_{ts}.jpg"'}
-    )
-
-
-# ==============================================================================
-# API: ARCHIV & ZEITRAUM-EXPORT (NUR ADMIN)
-# ==============================================================================
-
-@app.route("/api/archive", methods=["GET"])
-@admin_required
-def api_archive_list():
-    ensure_daily_folders()
-    today = datetime.date.today().isoformat()
-    # ensure_daily_folders legt auch den morgigen Ordner an -> Zukunft nicht anzeigen
-    available_dates = sorted(
-        [d for d in os.listdir(RECORDINGS_DIR)
-         if DATE_RE.match(d) and d <= today and os.path.isdir(os.path.join(RECORDINGS_DIR, d))],
-        reverse=True
-    )
-    if today not in available_dates:
-        available_dates.insert(0, today)
-    date_filter = request.args.get("date", "").strip()
-    if date_filter not in available_dates:
-        date_filter = today
-    cam_filter = request.args.get("camera_id", "").strip()
-    t_from = parse_clock(request.args.get("from", ""), 0)
-    t_to = parse_clock(request.args.get("to", ""), 86400, is_end=True)
-    if t_to <= t_from:
-        t_from, t_to = 0, 86400
-
-    events = [e for e in load_events(date_filter)
-              if (not cam_filter or e["cam_id"] == cam_filter) and e["start"] < t_to and e["end"] > t_from]
-    now_sec = None
-    if date_filter == today:
-        now_sec = time.time() - datetime.datetime.strptime(today, "%Y-%m-%d").timestamp()
-    return jsonify({
-        "available_dates": available_dates,
-        "selected_date": date_filter,
-        "recordings": list_recordings(date_filter, cam_filter, t_from, t_to),
-        "events": events,
-        "window": {"from": t_from, "to": t_to},
-        "now_sec": now_sec
-    })
-
-
-def probe_duration(path):
+    target_slug = slugify(title)
     try:
-        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-                             capture_output=True, text=True, timeout=30).stdout.strip()
-        return float(out)
-    except Exception:
-        return 0.0
-
-
-CLIP_CACHE_DIR = os.path.join(tempfile.gettempdir(), "opencam_live_clips")
-
-
-def probe_live_duration(path):
-    """Dauer einer (noch wachsenden) fragmentierten MP4: ffprobe, sonst Paket-Durchlauf ohne Re-Encoding."""
-    d = probe_duration(path)
-    if d > 0:
-        return d
-    try:
-        res = subprocess.run(["ffmpeg", "-nostdin", "-i", path, "-map", "0:v:0", "-c", "copy", "-f", "null", "-"],
-                             capture_output=True, timeout=120)
-        times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr.decode(errors="ignore"))
-        if times:
-            hh, mm, ss = times[-1]
-            return int(hh) * 3600 + int(mm) * 60 + float(ss)
+        for p in base.rglob("*"):
+            if p.is_dir() and slugify(p.name) == target_slug:
+                if any(x in str(p).lower() for x in ("boxset", "collection", "metadata")):
+                    return p
     except Exception:
         pass
-    return 0.0
+    return None
 
 
-@app.route("/api/archive/clip")
-@admin_required
-def api_archive_clip():
-    """Schneidet ein Ereignis (Start/Ende in Sekunden seit Mitternacht) als MP4-Clip aus den Aufnahmen."""
-    date_str = request.args.get("date", "").strip()
-    cam_id = request.args.get("camera_id", "").strip()
+def sync_collection_theme(item: dict, mp3_path: Path, jf_meta_base: str):
+    if item.get("type") != "Collection" or not mp3_path or not mp3_path.exists():
+        return
+    jf_dir = find_jellyfin_boxset_dir(item["title"], jf_meta_base)
+    if jf_dir:
+        try:
+            shutil.copy2(mp3_path, jf_dir / "theme.mp3")
+        except Exception as e:
+            print(f"[Collection Sync Warnung] {e}")
+
+
+def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclude_slugs: set = None) -> tuple[List[dict], List[str]]:
+    results = []
+    scanned_dirs = []
+    if not paths_str:
+        return results, scanned_dirs
+
+    exclude_slugs = exclude_slugs or set()
+    paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
+    video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".iso"}
+
+    for base_str in paths:
+        base = Path(base_str)
+        if not base.exists() or not base.is_dir():
+            scanned_dirs.append(f"❌ {base_str} (Path does not exist in container)")
+            continue
+
+        scanned_dirs.append(f"📁 Local Storage Mount: {base_str}")
+        try:
+            for root, dirs, files in os.walk(base):
+                global stop_requested
+                if stop_requested:
+                    break
+
+                rpath = Path(root)
+                if rpath.name.startswith(".") or rpath.name.lower() in ("@eadir", "$recycle.bin", "system volume information"):
+                    continue
+
+                try:
+                    rel_parts = rpath.relative_to(base).parts
+                except ValueError:
+                    rel_parts = ()
+                if len(rel_parts) > 3:
+                    continue
+
+                has_video = any(Path(f).suffix.lower() in video_exts for f in files)
+                has_theme = bool(find_theme_file_in_dir(rpath))
+                has_seasons = any(re.search(r"season|staffel|specials", d, re.IGNORECASE) for d in dirs)
+
+                if has_video or has_theme or has_seasons:
+                    if re.search(r"^(season|staffel|specials|\bs\d+)", rpath.name, re.IGNORECASE):
+                        continue
+
+                    name = rpath.name
+                    year = None
+                    m = re.search(r"^(.*?)\s*[\(\[](\d{4})[\)\]]", name)
+                    if m:
+                        title = m.group(1).strip()
+                        year = m.group(2)
+                    else:
+                        title = re.sub(r"[\._]", " ", name).strip()
+
+                    itype = "Serie" if has_seasons or any("s01" in f.lower() or "staffel" in f.lower() for f in files) else "Film"
+                    if filter_type and itype != filter_type:
+                        continue
+
+                    item_slug = f"{slugify(title)}_{year or ''}"
+                    alt_slug = slugify(title)
+                    if item_slug in exclude_slugs or alt_slug in exclude_slugs or str(rpath) in exclude_slugs:
+                        continue
+
+                    item_id = f"local_{abs(hash(str(rpath)))}"
+
+                    results.append({
+                        "id": item_id,
+                        "source": "Lokal",
+                        "type": itype,
+                        "title": title,
+                        "original_title": "",
+                        "year": year,
+                        "dir": str(rpath)
+                    })
+        except Exception as e:
+            print(f"[Lokaler Scan Fehler bei {base_str}] {e}")
+
+    return results, scanned_dirs
+
+
+def test_jellyfin_connection(url: str, api_key: str) -> dict:
+    url = clean_url_input(url)
+    api_key = api_key.strip()
+    if not url:
+        return {"ok": False, "msg": "Please enter Jellyfin IP and port (e.g. 192.168.1.50:8096)"}
+    if not api_key:
+        return {"ok": False, "msg": "Please enter Jellyfin API Key"}
+
+    headers = get_jellyfin_headers(api_key)
     try:
-        t0 = max(0.0, float(request.args.get("start", "")))
-        t1 = min(86400.0, float(request.args.get("end", "")))
-    except ValueError:
-        return jsonify({"error": "Ungültige Zeit"}), 400
-    fmt = request.args.get("format", "mp4")
-    inline = request.args.get("inline") == "1"   # Wiedergabe im Browser statt Download (Live-Archiv)
-    cache_file = None
-    if inline and fmt == "mp4":
-        os.makedirs(CLIP_CACHE_DIR, exist_ok=True)
-        for fn in os.listdir(CLIP_CACHE_DIR):   # alte Zwischenspeicher aufraeumen
-            fp = os.path.join(CLIP_CACHE_DIR, fn)
+        sys_resp = requests.get(f"{url}/System/Info", headers=headers, timeout=6)
+        server_name = "Jellyfin"
+        version = ""
+        if sys_resp.status_code == 200:
+            s_data = sys_resp.json()
+            server_name = s_data.get("ServerName", "Jellyfin")
+            version = s_data.get("Version", "")
+
+        users_resp = requests.get(f"{url}/Users", headers=headers, params={"api_key": api_key}, timeout=6)
+        if users_resp.status_code in (401, 403):
+            return {"ok": False, "msg": f"URL reachable, but API key is invalid (HTTP {users_resp.status_code})"}
+        users_resp.raise_for_status()
+        users = users_resp.json()
+
+        it_resp = requests.get(
+            f"{url}/Items",
+            headers=headers,
+            params={"IncludeItemTypes": "Movie,Series,BoxSet", "Recursive": "true", "Limit": "1", "api_key": api_key},
+            timeout=6
+        )
+        item_count = it_resp.json().get("TotalRecordCount", 0) if it_resp.status_code == 200 else 0
+
+        info_txt = f"Connected to '{server_name}' (v{version}) • {len(users)} users • {item_count} media items found!"
+        return {"ok": True, "msg": info_txt}
+    except requests.exceptions.ConnectTimeout:
+        return {"ok": False, "msg": "Connection timeout. Is Jellyfin running on this IP and port?"}
+    except requests.exceptions.ConnectionError:
+        return {"ok": False, "msg": "Connection refused. Please verify IP and port (e.g. 192.168.1.50:8096)!"}
+    except Exception as e:
+        return {"ok": False, "msg": f"Fehler: {str(e)}"}
+
+
+def test_plex_connection(url: str, token: str) -> dict:
+    url = clean_url_input(url)
+    token = token.strip()
+    if not url:
+        return {"ok": False, "msg": "Please enter Plex IP and port (e.g. 192.168.1.50:32400)"}
+    if not token:
+        return {"ok": False, "msg": "Please enter Plex Token"}
+
+    headers = {"X-Plex-Token": token, "Accept": "application/json"}
+    try:
+        resp = requests.get(f"{url}/", headers=headers, timeout=6)
+        if resp.status_code in (401, 403):
+            return {"ok": False, "msg": "URL reachable, but Plex token is invalid!"}
+        resp.raise_for_status()
+        data = resp.json().get("MediaContainer", {})
+        friendly_name = data.get("friendlyName", "Plex Server")
+        version = data.get("version", "")
+        return {"ok": True, "msg": f"Connected to '{friendly_name}' (v{version})!"}
+    except Exception as e:
+        return {"ok": False, "msg": f"Plex Fehler: {str(e)}"}
+
+
+def test_folder_path(paths_str: str) -> dict:
+    paths_str = paths_str.strip()
+    if not paths_str:
+        return {"ok": False, "msg": "No path specified"}
+
+    paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
+    details = []
+
+    for p in paths:
+        path_obj = Path(p)
+        if not path_obj.exists():
+            details.append(f"❌ '{p}' does not exist in container")
+        elif not path_obj.is_dir():
+            details.append(f"❌ '{p}' is not a directory")
+        else:
             try:
-                if time.time() - os.path.getmtime(fp) > 600:
-                    os.remove(fp)
-            except OSError:
-                pass
-        key = hashlib.md5(f"{date_str}|{cam_id}|{int(t0)}|{int(t1)}".encode()).hexdigest()
-        cache_file = os.path.join(CLIP_CACHE_DIR, key + ".mp4")
-        if os.path.isfile(cache_file) and time.time() - os.path.getmtime(cache_file) < 60:
-            return send_file(cache_file, mimetype="video/mp4", conditional=True)
-    if fmt == "gif":
-        t1 = min(t1, t0 + 30)   # GIFs auf 30 Sekunden begrenzen
-    if not DATE_RE.match(date_str) or not cam_id or t1 - t0 < 1 or t1 - t0 > 3600:
-        return jsonify({"error": "Ungültige Anfrage"}), 400
+                subdirs = [d.name for d in path_obj.iterdir() if d.is_dir() and not d.name.startswith(".")]
+                files = [f.name for f in path_obj.iterdir() if f.is_file()]
+                details.append(f"✓ '{p}': {len(subdirs)} subdirectories, {len(files)} files")
+            except Exception as e:
+                details.append(f"⚠️ '{p}' Lesefehler: {e}")
 
-    # Auch laufende ("recording") und gerade konvertierte ("processing") Aufnahmen verwenden -> Live-Suche
-    recs = list_recordings(date_str, cam_id, t0, t1)
-    if not recs:
-        return jsonify({"error": "Keine Aufnahme für diesen Zeitraum"}), 404
+    ok = any("✓" in d for d in details)
+    return {"ok": ok, "msg": " | ".join(details)}
 
-    work = tempfile.mkdtemp(prefix="clip_")
-    after_this_request(lambda r: (shutil.rmtree(work, ignore_errors=True), r)[1])
-    parts = []
-    with CLIP_SEM:
-        for i, r in enumerate(recs):
-            path = os.path.join(RECORDINGS_DIR, date_str, r["dir"], r["filename"])
-            if not os.path.isfile(path) and r["filename"].endswith(".rec.mp4"):
-                # Konvertierung war inzwischen fertig -> finale Datei verwenden
-                path = os.path.join(RECORDINGS_DIR, date_str, r["dir"], r["filename"][:-len(".rec.mp4")] + ".mp4")
-            live = r["status"] == "recording"
-            wall = max(1.0, r["end_sec"] - r["start_sec"])
-            dur = probe_live_duration(path) if live else probe_duration(path)
-            scale = (dur / wall) if dur > 0 else 1.0   # Videodauer kann von der Echtzeit abweichen
-            a = max(0.0, t0 - r["start_sec"]) * scale
-            b = min(wall, t1 - r["start_sec"]) * scale
-            if live and dur > 0:
-                b = min(b, dur)   # nicht ueber das bisher geschriebene Ende hinaus
-            if b - a < 0.5:
+
+def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = None) -> tuple[List[dict], List[str]]:
+    if not url or not api_key:
+        return [], []
+    headers = get_jellyfin_headers(api_key)
+    results = []
+    scanned_folders = []
+    seen_ids = set()
+
+    type_mapping = {"Film": "Movie", "Serie": "Series", "Collection": "BoxSet"}
+    item_types = type_mapping.get(filter_type, "Movie,Series,BoxSet")
+
+    try:
+        vf_resp = requests.get(f"{url}/Library/VirtualFolders", headers=headers, params={"api_key": api_key.strip()}, timeout=10)
+        if vf_resp.status_code == 200:
+            for vf in vf_resp.json():
+                name = vf.get("Name", "Unbenannt")
+                locations = vf.get("Locations", [])
+                loc_txt = ", ".join(locations) if locations else "Standardpfad"
+                scanned_folders.append(f"🎬 Jellyfin Library: '{name}' [{loc_txt}]")
+    except Exception as e:
+        print(f"[Jellyfin VirtualFolders Warnung] {e}")
+
+    try:
+        params = {
+            "IncludeItemTypes": item_types,
+            "Recursive": "true",
+            "Fields": "Path,ProductionYear,OriginalTitle,ImageTags,PrimaryImageAspectRatio,ProviderIds",
+            "EnableTotalRecordCount": "true",
+            "api_key": api_key.strip()
+        }
+        resp = requests.get(f"{url}/Items", headers=headers, params=params, timeout=35)
+        resp.raise_for_status()
+
+        for item in resp.json().get("Items", []):
+            item_type = item.get("Type")
+            title = item.get("Name", "Unbekannt")
+            clean_id = item["Id"]
+            item_id = f"jf_{clean_id}"
+
+            if item_id in seen_ids:
                 continue
-            out = os.path.join(work, f"p{i}.mp4")
-            res = subprocess.run(
-                ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-ss", f"{a:.3f}", "-i", path, "-t", f"{b - a:.3f}",
-                 "-c:v", "libx264", "-preset", "ultrafast" if inline else "veryfast", "-crf", "26", "-pix_fmt", "yuv420p", "-an",
-                 "-movflags", "+faststart", out], capture_output=True, timeout=600)
-            if res.returncode == 0 and os.path.isfile(out):
-                parts.append(out)
-        if not parts:
-            return jsonify({"error": "Clip konnte nicht erstellt werden"}), 500
-        final = parts[0]
-        if len(parts) > 1:
-            lst = os.path.join(work, "list.txt")
-            with open(lst, "w") as f:
-                f.writelines(f"file '{p}'\n" for p in parts)
-            final = os.path.join(work, "clip.mp4")
-            res = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
-                                  "-i", lst, "-c", "copy", "-movflags", "+faststart", final], capture_output=True, timeout=600)
+            seen_ids.add(item_id)
+
+            has_image = bool(item.get("ImageTags", {}).get("Primary"))
+            p_ids = item.get("ProviderIds") or {}
+            tmdb_id = p_ids.get("Tmdb") or p_ids.get("TmdbCollection")
+            imdb_id = p_ids.get("Imdb")
+            tvdb_id = p_ids.get("Tvdb")
+
+            if item_type == "BoxSet":
+                if filter_type and filter_type != "Collection":
+                    continue
+                col_dir = COLLECTIONS_DIR / f"{item_id}_{slugify(title)}"
+                col_dir.mkdir(parents=True, exist_ok=True)
+                results.append({
+                    "id": item_id,
+                    "jf_raw_id": clean_id,
+                    "source": "Jellyfin",
+                    "type": "Collection",
+                    "title": title,
+                    "original_title": item.get("OriginalTitle") or "",
+                    "year": item.get("ProductionYear"),
+                    "dir": str(col_dir),
+                    "has_poster": has_image,
+                    "tmdb_id": tmdb_id,
+                    "imdb_id": imdb_id,
+                    "tvdb_id": tvdb_id
+                })
+                continue
+
+            raw_path = item.get("Path")
+            if not raw_path:
+                continue
+
+            resolved = resolve_media_path(raw_path)
+            target_dir = resolved.parent if item_type == "Movie" else resolved
+            itype = "Serie" if item_type == "Series" else "Film"
+
+            if filter_type and itype != filter_type:
+                continue
+
+            results.append({
+                "id": item_id,
+                "jf_raw_id": clean_id,
+                "source": "Jellyfin",
+                "type": itype,
+                "title": title,
+                "original_title": item.get("OriginalTitle") or "",
+                "year": item.get("ProductionYear"),
+                "dir": str(target_dir),
+                "raw_path": raw_path,
+                "has_poster": has_image,
+                "tmdb_id": tmdb_id,
+                "imdb_id": imdb_id,
+                "tvdb_id": tvdb_id
+            })
+    except Exception as e:
+        print(f"[Jellyfin Fetch Fehler] {e}")
+        scanned_folders.append(f"❌ Jellyfin Fetch Error: {e}")
+
+    return results, scanned_folders
+
+
+def fetch_plex_items(url: str, token: str, filter_type: Optional[str] = None) -> tuple[List[dict], List[str]]:
+    if not url or not token:
+        return [], []
+    headers = {"X-Plex-Token": token, "Accept": "application/json"}
+    results = []
+    scanned_folders = []
+    try:
+        sec_resp = requests.get(f"{url}/library/sections", headers=headers, timeout=10)
+        sec_resp.raise_for_status()
+        data = sec_resp.json().get("MediaContainer", {})
+
+        for directory in data.get("Directory", []):
+            sec_id = directory.get("key")
+            sec_type = directory.get("type")
+            sec_title = directory.get("title", "Library")
+            if sec_type not in ("movie", "show"):
+                continue
+
+            scanned_folders.append(f"🍿 Plex Library: '{sec_title}' ({sec_type})")
+            items_resp = requests.get(f"{url}/library/sections/{sec_id}/all", headers=headers, timeout=25)
+            items_data = items_resp.json().get("MediaContainer", {})
+
+            for video in items_data.get("Metadata", []):
+                rkey = video.get("ratingKey")
+                vtype = "Film" if sec_type == "movie" else "Serie"
+                if filter_type and vtype != filter_type:
+                    continue
+
+                vtitle = video.get("title", "Unbekannt")
+                thumb = video.get("thumb")
+
+                media_parts = video.get("Media", [{}])[0].get("Part", [{}])
+                file_path = media_parts[0].get("file") if media_parts else None
+                if not file_path:
+                    continue
+
+                resolved = resolve_media_path(file_path)
+                p = resolved.parent if vtype == "Film" else resolved
+
+                results.append({
+                    "id": f"plex_{rkey}",
+                    "plex_thumb": thumb,
+                    "source": "Plex",
+                    "type": vtype,
+                    "title": vtitle,
+                    "original_title": video.get("originalTitle", ""),
+                    "year": video.get("year"),
+                    "dir": str(p),
+                    "raw_path": file_path,
+                    "has_poster": bool(thumb)
+                })
+
+            if not filter_type or filter_type == "Collection":
+                try:
+                    col_resp = requests.get(f"{url}/library/sections/{sec_id}/collections", headers=headers, timeout=15)
+                    for col in col_resp.json().get("MediaContainer", {}).get("Metadata", []):
+                        rkey = col.get("ratingKey")
+                        ctitle = col.get("title", "Collection")
+                        cid = f"plex_col_{rkey}"
+                        cdir = COLLECTIONS_DIR / f"{cid}_{slugify(ctitle)}"
+                        cdir.mkdir(parents=True, exist_ok=True)
+                        results.append({
+                            "id": cid,
+                            "plex_thumb": col.get("thumb"),
+                            "source": "Plex",
+                            "type": "Collection",
+                            "title": ctitle,
+                            "original_title": "",
+                            "year": col.get("maxYear") or col.get("minYear"),
+                            "dir": str(cdir),
+                            "has_poster": bool(col.get("thumb"))
+                        })
+                except Exception:
+                    pass
+
+    except Exception as e:
+        print(f"[Plex Fehler] {e}")
+    return results, scanned_folders
+
+
+def build_search_queries(item: dict) -> List[str]:
+    title = item["title"].strip()
+    orig = (item.get("original_title") or "").strip()
+    year = item.get("year")
+    itype = item["type"]
+    queries = []
+
+    st_info = discover_soundtrack_info(item)
+    composer = st_info.get("composer", "")
+    exact_song = st_info.get("title", "")
+    direct_url = st_info.get("direct_url", "")
+
+    if direct_url:
+        queries.append(direct_url)
+
+    if composer and exact_song:
+        queries.append(f"ytsearch8:{composer} {exact_song} {title} Official Soundtrack")
+        queries.append(f"ytsearch6:{composer} {exact_song} Official Audio")
+    elif composer:
+        queries.append(f"ytsearch8:{composer} {title} Soundtrack Main Theme")
+        queries.append(f"ytsearch6:{composer} {orig or title} Score")
+    elif exact_song:
+        queries.append(f"ytsearch8:{title} {exact_song} Soundtrack Theme")
+
+    if itype == "Serie":
+        queries.append(f"ytsearch8:{title} Opening Theme Song Soundtrack")
+        queries.append(f"ytsearch6:{title} Titelmelodie Instrumental")
+        if orig and orig.lower() != title.lower():
+            queries.append(f"ytsearch8:{orig} TV Theme Song Audio")
+            queries.append(f"ytsearch6:{orig} Opening Credits Soundtrack")
+    elif itype == "Collection":
+        queries.append(f"ytsearch8:{title} Soundtrack Main Theme")
+        clean_col = re.sub(r"\b(collection|reihe|sammlung|filmreihe)\b", "", title, flags=re.IGNORECASE).strip()
+        if clean_col and clean_col.lower() != title.lower():
+            queries.append(f"ytsearch8:{clean_col} Main Theme Soundtrack")
+        if orig and orig.lower() != title.lower():
+            queries.append(f"ytsearch8:{orig} Main Theme Score")
+    else:
+        if orig and orig.lower() != title.lower():
+            queries.append(f"ytsearch8:{orig} {year or ''} Soundtrack Main Title".strip())
+            queries.append(f"ytsearch6:{orig} Official Audio Theme")
+        queries.append(f"ytsearch8:{title} {year or ''} Soundtrack Main Title".strip())
+        queries.append(f"ytsearch6:{title} Titelmusik Instrumental")
+
+    base_name = orig if orig else title
+    queries.append(f"scsearch6:{base_name} Main Theme Soundtrack")
+    return queries
+
+
+def find_all_candidates(search_expr: str, blacklist: List[str], min_dur: int, max_dur: int) -> List[dict]:
+    cmd = [
+        "yt-dlp",
+        search_expr,
+        "--dump-json",
+        "--flat-playlist",
+        "--no-warnings"
+    ]
+    candidates = []
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        lines = res.stdout.strip().splitlines()
+        for line in lines:
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            vid_id = entry.get("id", "")
+            vid_title = entry.get("title", "")
+            duration = entry.get("duration") or 0
+            uploader = entry.get("uploader") or entry.get("channel") or ""
+            url = entry.get("url") or entry.get("webpage_url") or (
+                f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
+            )
+            lower_title = vid_title.lower()
+
+            if not url or vid_id in blacklist:
+                continue
+            if duration and (duration < min_dur or duration > max_dur):
+                continue
+            if any(bad in lower_title for bad in EXCLUDE_KEYWORDS):
+                continue
+
+            candidates.append({
+                "id": vid_id or url,
+                "url": url,
+                "title": vid_title,
+                "duration": duration,
+                "uploader": uploader
+            })
+    except Exception:
+        pass
+    return candidates
+
+
+def post_process_audio(input_file: Path, output_file: Path, duration: int, fade: bool = True):
+    temp_processed = input_file.parent / f"processed_{input_file.name}"
+    
+    af_filter = []
+    if fade:
+        af_filter.append("afade=t=in:ss=0:d=1.5")
+        if duration and duration > 6:
+            out_start = max(1.0, duration - 3.0)
+            af_filter.append(f"afade=t=out:st={out_start}:d=3.0")
+
+    af_arg = ",".join(af_filter) if af_filter else "anull"
+    cmd = ["ffmpeg", "-y", "-i", str(input_file), "-c:a", "libmp3lame", "-b:a", "192k", "-af", af_arg, str(temp_processed)]
+
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        if temp_processed.exists() and temp_processed.stat().st_size > 1024:
+            if output_file.exists():
+                output_file.unlink()
+            temp_processed.rename(output_file)
+            input_file.unlink(missing_ok=True)
+            return True
+    except Exception as e:
+        print(f"[FFmpeg Filter Warnung] {e}")
+
+    if input_file.exists():
+        if output_file.exists():
+            output_file.unlink()
+        input_file.rename(output_file)
+    return True
+
+
+def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None, min_dur: int = 25, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata", fade: bool = True) -> dict:
+    global scan_progress
+    item_id = item["id"]
+    blacklist = blacklist or []
+    target_dir = Path(item["dir"])
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        test_write = target_dir / ".theme_test_write"
+        test_write.write_text("ok")
+        test_write.unlink()
+    except Exception:
+        safe_fallback = LOCAL_THEMES_DIR / item_id
+        safe_fallback.mkdir(parents=True, exist_ok=True)
+        target_dir = safe_fallback
+        item["dir"] = str(safe_fallback)
+
+    output_mp3 = target_dir / "theme.mp3"
+    temp_template = str(target_dir / "theme_temp.%(ext)s")
+
+    for old_tmp in target_dir.glob("theme_temp.*"):
+        old_tmp.unlink(missing_ok=True)
+
+    is_direct_url = custom_query_or_url and (
+        custom_query_or_url.startswith("http://") or custom_query_or_url.startswith("https://")
+    )
+
+    candidates = []
+    if is_direct_url:
+        candidates = [{"url": custom_query_or_url, "title": "Manueller Link", "id": custom_query_or_url, "duration": 180}]
+    else:
+        scan_progress["item_status"][item_id] = {"status": "searching", "percent": 20, "step": "Searching soundtrack..."}
+        search_list = (
+            [f"ytsearch8:{custom_query_or_url}", f"scsearch6:{custom_query_or_url}"]
+            if custom_query_or_url
+            else build_search_queries(item)
+        )
+        for expr in search_list:
+            cands = find_all_candidates(expr, blacklist, min_dur, max_dur)
+            if cands:
+                candidates.extend(cands)
+                if len(candidates) >= 5:
+                    break
+
+    if not candidates:
+        scan_progress["item_status"][item_id] = {"status": "failed", "percent": 100, "step": "No soundtrack found"}
+        return {"ok": False, "msg": "No clean theme music found (only trailers/scenes or no matches)"}
+
+    last_err = ""
+    for idx, chosen_video in enumerate(candidates, 1):
+        scan_progress["item_status"][item_id] = {
+            "status": "downloading",
+            "percent": int(30 + (idx / len(candidates)) * 40),
+            "step": f"Downloading ({idx}/{len(candidates)}): {chosen_video['title'][:35]}..."
+        }
+
+        dl_cmd = [
+            "yt-dlp",
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "192K",
+            "--no-playlist",
+            "-o", temp_template,
+            chosen_video["url"]
+        ]
+        try:
+            res = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=90)
             if res.returncode != 0:
-                final = parts[0]
-    h, m, sec = int(t0 // 3600), int(t0 % 3600 // 60), int(t0 % 60)
-    name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', recs[0]['camera_name'])}_{date_str}_{h:02d}{m:02d}{sec:02d}.mp4"
-    if fmt == "gif":
-        gif = os.path.join(work, "clip.gif")
-        res = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", final, "-vf",
-                              "fps=8,scale=480:-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse",
-                              "-loop", "0", gif], capture_output=True, timeout=600)
-        if res.returncode != 0 or not os.path.isfile(gif):
-            return jsonify({"error": "GIF konnte nicht erstellt werden"}), 500
-        return send_file(gif, mimetype="image/gif", as_attachment=True, download_name=name[:-4] + ".gif")
-    if cache_file:   # kurz zwischenspeichern: der Browser fragt fuer Vor-/Zurueckspulen mehrfach an
-        tmp = cache_file + f".{uuid.uuid4().hex[:6]}.tmp"
-        shutil.copyfile(final, tmp)
-        os.replace(tmp, cache_file)
-        return send_file(cache_file, mimetype="video/mp4", conditional=True)
-    return send_file(final, mimetype="video/mp4", as_attachment=True, download_name=name)
+                err_line = res.stderr.strip().splitlines()[-1] if res.stderr else "Error"
+                last_err = err_line[:80]
+                blacklist.append(chosen_video["id"])
+                continue
+
+            downloaded = target_dir / "theme_temp.mp3"
+            if downloaded.exists() and downloaded.stat().st_size > 1024:
+                scan_progress["item_status"][item_id] = {"status": "processing", "percent": 85, "step": "Mastering audio (Fade-in/out)..."}
+
+                post_process_audio(downloaded, output_mp3, chosen_video.get("duration", 180), fade=fade)
+                sync_collection_theme(item, output_mp3, jf_meta_base)
+
+                scan_progress["item_status"][item_id] = {"status": "done", "percent": 100, "step": "Successfully downloaded!"}
+                return {
+                    "ok": True,
+                    "video_id": chosen_video["id"],
+                    "video_title": chosen_video["title"]
+                }
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    scan_progress["item_status"][item_id] = {"status": "failed", "percent": 100, "step": f"Error: {last_err[:40]}"}
+    return {"ok": False, "msg": f"All candidates failed ({last_err[:60]})"}
 
 
-@app.route("/api/archive/snapshot/<date_str>/<filename>")
-@admin_required
-def api_archive_snapshot(date_str, filename):
-    if not DATE_RE.match(date_str) or not re.match(r"^[A-Za-z0-9_.-]+\.jpg$", filename):
-        abort(404)
-    path = os.path.join(RECORDINGS_DIR, date_str, "snapshots", filename)
-    if not os.path.isfile(path):
-        abort(404)
-    return send_file(path, mimetype="image/jpeg", max_age=3600)
+def run_scan(scope: str = "all"):
+    """Führt entweder einen strikten Einzelkategorie-Scan oder einen globalen Komplett-Scan aus"""
+    global scan_progress, stop_requested
+    if scan_progress["is_running"]:
+        return
+
+    stop_requested = False
+    scan_progress["is_running"] = True
+    scan_progress["action_type"] = "scan"
+    cfg = load_config()
+    scope_key = "all_media" if scope == "all" else ("movies_plural" if scope in ("Movie", "Film") else ("shows_plural" if scope in ("Serie", "Series") else "collections_plural"))
+    scope_name = get_t(cfg, scope_key)
+    scan_progress["current_step"] = get_t(cfg, "scanning", scope=scope_name)
+    scan_progress["processed"] = 0
+    scan_progress["total"] = 0
+    scan_progress["percent"] = 0
+    scan_progress["new_downloaded"] = 0
+    scan_progress["failed"] = 0
+
+    try:
+        cfg = load_config()
+        state = load_state()
+
+        filter_type = None if scope == "all" else scope
+
+        raw_items = []
+        all_scanned_folders = []
+        jf_slugs = set()
+
+        if cfg.get("jellyfin_url") and cfg.get("jellyfin_api_key"):
+            scan_progress["current_step"] = get_t(cfg, "fetching_jf", scope=scope_name)
+            jf_items, jf_folders = fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", ""), filter_type=filter_type)
+            raw_items.extend(jf_items)
+            all_scanned_folders.extend(jf_folders)
+            for it in jf_items:
+                jf_slugs.add(f"{slugify(it['title'])}_{it.get('year') or ''}")
+                jf_slugs.add(slugify(it["title"]))
+                if it.get("dir"):
+                    jf_slugs.add(it["dir"])
+
+        if cfg.get("plex_url") and cfg.get("plex_token"):
+            scan_progress["current_step"] = get_t(cfg, "fetching_plex", scope=scope_name)
+            plex_items, plex_folders = fetch_plex_items(cfg.get("plex_url", ""), cfg.get("plex_token", ""), filter_type=filter_type)
+            raw_items.extend(plex_items)
+            all_scanned_folders.extend(plex_folders)
+            for it in plex_items:
+                jf_slugs.add(f"{slugify(it['title'])}_{it.get('year') or ''}")
+                jf_slugs.add(slugify(it["title"]))
+                if it.get("dir"):
+                    jf_slugs.add(it["dir"])
+
+        if cfg.get("local_scan_enabled", True):
+            scan_progress["current_step"] = get_t(cfg, "scanning_local", scope=scope_name)
+            loc_items, loc_folders = scan_local_folders(
+                cfg.get("local_media_paths", "/media"),
+                filter_type=filter_type,
+                exclude_slugs=jf_slugs
+            )
+            raw_items.extend(loc_items)
+            all_scanned_folders.extend(loc_folders)
+
+        # 1. Sammle neu eingelesene Items
+        current_state_items = {}
+        for it in raw_items:
+            current_state_items[it["id"]] = it
+
+        # 2. DEDUPLIZIERUNG: 1 Film / Serie = 1 Zeile
+        unified_items = {}
+        source_prio = {"Jellyfin": 3, "Plex": 2, "Lokal": 1}
+
+        # Behalte Items anderer Kategorien unangetastet!
+        existing_other = {}
+        existing_same = {}
+        for k, v in state.get("items", {}).items():
+            if scope != "all" and v.get("type") != scope:
+                existing_other[k] = v
+            else:
+                existing_same[k] = v
+
+        combined = list(existing_same.values()) + list(current_state_items.values())
+        for it in combined:
+            it_type = it.get("type", "Film")
+            it_title_slug = slugify(it.get("title", ""))
+            it_year = it.get("year") or ""
+            unique_key = f"{it_type}_{it_title_slug}_{it_year}"
+
+            if unique_key not in unified_items:
+                unified_items[unique_key] = it
+            else:
+                existing = unified_items[unique_key]
+                prio_new = source_prio.get(it.get("source"), 0)
+                prio_old = source_prio.get(existing.get("source"), 0)
+                if prio_new > prio_old:
+                    unified_items[unique_key] = {**existing, **it}
+                else:
+                    unified_items[unique_key] = {**it, **existing}
+
+        # Strikte Filterung: Verarbeite NUR Items der gewählten Rubrik!
+        items_to_process = list(unified_items.values())
+        if scope != "all":
+            items_to_process = [it for it in items_to_process if it.get("type") == scope]
+
+        total_items = len(items_to_process)
+        scan_progress["total"] = total_items
+        jf_meta = cfg.get("jf_metadata_dir", "/jellyfin-metadata")
+
+        for idx, it in enumerate(items_to_process, 1):
+            if stop_requested:
+                scan_progress["current_step"] = get_t(cfg, "scan_cancelled")
+                break
+
+            item_id = it["id"]
+            scan_progress["processed"] = idx
+            scan_progress["percent"] = int((idx / max(1, total_items)) * 100)
+            scan_progress["current_item_title"] = f"{it['title']}"
+            scan_progress["current_item_id"] = item_id
+
+            existing = existing_same.get(item_id, {})
+            theme_exists, actual_dir, mp3_file = check_item_theme(it, existing, cfg)
+
+            it["dir"] = actual_dir
+
+            if theme_exists and it.get("type") == "Collection" and mp3_file:
+                sync_collection_theme(it, mp3_file, jf_meta)
+
+            if theme_exists:
+                status_txt = it.get("video_title") or existing.get("video_title") or (mp3_file.name if mp3_file else "Present")
+                scan_progress["item_status"][item_id] = {"status": "ok", "percent": 100, "step": "Present"}
+            else:
+                prev_status = existing.get("status", "")
+                status_txt = prev_status if prev_status and prev_status not in ("Vorhanden", "Present") else "Missing"
+                scan_progress["item_status"][item_id] = {"status": "missing", "percent": 0, "step": "Missing"}
+
+            record = {
+                **existing,
+                **it,
+                "has_theme": theme_exists,
+                "status": status_txt
+            }
+            existing_same[item_id] = record
+
+        # Speichere die bearbeitete Kategorie zusammen mit den unangetasteten anderen Kategorien ab
+        state["items"] = {**existing_other, **existing_same}
+
+        if scope == "all":
+            state["folders"] = all_scanned_folders
+
+        save_state(state)
+        if not stop_requested:
+            scan_progress["current_step"] = get_t(cfg, "scan_complete", count=total_items, scope=scope_name)
+    except Exception as e:
+        scan_progress["current_step"] = get_t(cfg, "scan_error", err=e)
+    finally:
+        scan_progress["is_running"] = False
 
 
-@app.route("/api/archive/video/<date_str>/<filename>")
-@admin_required
-def api_archive_video(date_str, filename):
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str) or "/" in filename or "\\" in filename:
-        abort(400)
-    fpath = find_rec_file(date_str, filename)
-    if not fpath:
-        abort(404)
-    dl = request.args.get("download") == "1"
-    return send_file(fpath, mimetype="video/mp4", as_attachment=dl, download_name=filename)
+def run_download_queue(scope: str = "all"):
+    """Lädt fehlende Themes in die Warteschlange – unterstützt Fortschrittsbalken pro Zeile & global"""
+    global scan_progress, stop_requested
+    if scan_progress["is_running"]:
+        return
+
+    stop_requested = False
+    scan_progress["is_running"] = True
+    scan_progress["action_type"] = "download"
+    scan_progress["current_step"] = "Initializing download queue..."
+    scan_progress["processed"] = 0
+    scan_progress["percent"] = 0
+    scan_progress["new_downloaded"] = 0
+    scan_progress["failed"] = 0
+    scan_progress["queue"] = []
+    scan_progress["recent_finished"] = []
+
+    try:
+        cfg = load_config()
+        state = load_state()
+        min_dur = cfg.get("min_duration_sec", 25)
+        max_dur = cfg.get("max_duration_sec", 270)
+        fade_active = cfg.get("audio_fade", True)
+        jf_meta = cfg.get("jf_metadata_dir", "/jellyfin-metadata")
+
+        all_missing = [it for it in state["items"].values() if not it.get("has_theme")]
+        if scope != "all":
+            missing_items = [it for it in all_missing if it.get("type") == scope]
+        else:
+            missing_items = all_missing
+
+        total_missing = len(missing_items)
+        scan_progress["total"] = total_missing
+
+        if total_missing == 0:
+            scan_progress["current_step"] = get_t(cfg, "no_missing")
+            return
+
+        scan_progress["queue"] = [it["title"] for it in missing_items]
+
+        for idx, it in enumerate(missing_items, 1):
+            if stop_requested:
+                scan_progress["current_step"] = get_t(cfg, "download_cancelled")
+                break
+
+            item_id = it["id"]
+            title = it["title"]
+            scan_progress["processed"] = idx
+            scan_progress["percent"] = int((idx / total_missing) * 100)
+            scan_progress["current_item_title"] = f"{title} ({it.get('type')})"
+            scan_progress["current_item_id"] = item_id
+            scan_progress["current_step"] = f"Lade ({idx}/{total_missing}): {title}..."
+
+            if scan_progress["queue"]:
+                scan_progress["queue"].pop(0)
+
+            bl = state["blacklist"].get(item_id, [])
+            dl_res = search_and_download(
+                it,
+                blacklist=bl,
+                min_dur=min_dur,
+                max_dur=max_dur,
+                jf_meta_base=jf_meta,
+                fade=fade_active
+            )
+
+            if dl_res["ok"]:
+                it["has_theme"] = True
+                it["video_id"] = dl_res["video_id"]
+                it["video_title"] = dl_res["video_title"]
+                it["status"] = dl_res["video_title"] or "Downloaded"
+                scan_progress["new_downloaded"] += 1
+                scan_progress["recent_finished"].insert(0, {"title": title, "ok": True, "msg": dl_res["video_title"] or "Downloaded"})
+            else:
+                it["status"] = dl_res["msg"]
+                scan_progress["failed"] += 1
+                scan_progress["recent_finished"].insert(0, {"title": title, "ok": False, "msg": dl_res["msg"]})
+
+            scan_progress["recent_finished"] = scan_progress["recent_finished"][:8]
+
+            state["items"][item_id] = it
+            save_state(state)
+
+        if not stop_requested:
+            scan_progress["current_step"] = get_t(cfg, "download_complete", down=scan_progress["new_downloaded"], fail=scan_progress["failed"])
+    except Exception as e:
+        scan_progress["current_step"] = get_t(cfg, "download_error", err=e)
+    finally:
+        scan_progress["is_running"] = False
+        scan_progress["current_item_id"] = ""
 
 
-@app.route("/api/archive/video/<date_str>/<filename>", methods=["DELETE"])
-@admin_required
-def api_archive_delete(date_str, filename):
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str) or "/" in filename or "\\" in filename:
-        abort(400)
-    fpath = find_rec_file(date_str, filename)
-    if fpath:
-        os.remove(fpath)
-    return jsonify({"status": "ok"})
+@app.get("/poster/{item_id}")
+def get_poster(item_id: str):
+    """Liefert das hochauflösende Cover: Erst per Jellyfin-API, dann tolerante lokale Metadaten-Erkennung"""
+    state = load_state()
+    cfg = load_config()
+    item = state["items"].get(item_id)
+    if not item:
+        raise HTTPException(status_code=404)
+
+    # 1. Prio: Jellyfin Primary Image API (funktioniert immer unabhängig von Festplatten-Dateinamen!)
+    if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
+        jf_url = cfg["jellyfin_url"]
+        raw_id = item["jf_raw_id"]
+        api_key = cfg.get("jellyfin_api_key", "").strip()
+        headers = get_jellyfin_headers(api_key)
+
+        for img_type in ("Primary", "Thumb", "Backdrop"):
+            img_url = f"{jf_url}/Items/{raw_id}/Images/{img_type}"
+            try:
+                r = requests.get(
+                    img_url,
+                    headers=headers,
+                    params={"fillWidth": "240", "quality": "90", "api_key": api_key},
+                    timeout=5
+                )
+                if r.status_code == 200 and len(r.content) > 500:
+                    ct = r.headers.get("Content-Type", "image/jpeg")
+                    return Response(content=r.content, media_type=ct)
+            except Exception:
+                pass
+
+    # 2. Prio: Plex Thumbnail
+    if item.get("source") == "Plex" and item.get("plex_thumb") and cfg.get("plex_url"):
+        plex_url = cfg["plex_url"]
+        token = cfg.get("plex_token", "").strip()
+        try:
+            r = requests.get(f"{plex_url}{item['plex_thumb']}", headers={"X-Plex-Token": token}, timeout=5)
+            if r.status_code == 200 and len(r.content) > 500:
+                ct = r.headers.get("Content-Type", "image/jpeg")
+                return Response(content=r.content, media_type=ct)
+        except Exception:
+            pass
+
+    # 3. Prio: Lokale Festplatten-Erkennung (Hochformat & flexible Dateinamen)
+    p = Path(item.get("dir", ""))
+    cover_file = find_local_cover_image(p, title=item.get("title", ""))
+    if cover_file and cover_file.exists():
+        return FileResponse(cover_file)
+
+    # 4. Fallback: Saubere SVG-Initialen
+    initial = (item.get("title") or "?")[0].upper()
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="60" height="90" viewBox="0 0 60 90">
+        <rect width="100%" height="100%" fill="#262a32" rx="4"/>
+        <text x="50%" y="54%" font-family="sans-serif" font-size="24" fill="#7d8590" text-anchor="middle" dominant-baseline="middle">{initial}</text>
+    </svg>"""
+    return Response(content=svg, media_type="image/svg+xml")
 
 
-@app.route("/api/archive/export", methods=["GET"])
-@admin_required
-def api_archive_export_zip():
-    date_filter = request.args.get("date", "").strip()
-    time_from = request.args.get("from", "00:00").strip() or "00:00"
-    time_to = request.args.get("to", "23:59").strip() or "23:59"
-    cam_filter = request.args.get("camera_id", "").strip()
+@app.get("/audio/{item_id}")
+def stream_audio(item_id: str):
+    state = load_state()
+    item = state["items"].get(item_id)
+    if not item:
+        raise HTTPException(status_code=404)
 
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_filter):
-        return jsonify({"error": "Ungültiges Datum"}), 400
+    has_theme, real_dir, mp3_file = check_item_theme(item)
+    if not has_theme or not mp3_file or not mp3_file.exists():
+        raise HTTPException(status_code=404)
 
-    target_dir = os.path.join(RECORDINGS_DIR, date_filter)
-    if not os.path.isdir(target_dir):
-        return jsonify({"error": "Ordner nicht gefunden"}), 404
-
-    t_from = parse_clock(time_from, 0)
-    t_to = parse_clock(time_to, 86400, is_end=True)
-    mem_zip = tempfile.TemporaryFile()
-    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
-        for rec in list_recordings(date_filter, cam_filter, t_from, t_to):
-            if rec["status"] == "ready":
-                zf.write(os.path.join(target_dir, rec["dir"], rec["filename"]),
-                         arcname="/".join(x for x in (date_filter, rec["dir"], rec["filename"]) if x))
-
-    mem_zip.seek(0)
-    zip_name = f"OpenCam_Archive_{date_filter}_{time_from.replace(':','')}-{time_to.replace(':','')}.zip"
-    return send_file(mem_zip, mimetype="application/zip", as_attachment=True, download_name=zip_name)
+    return FileResponse(mp3_file, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+@app.get("/api/candidate-stream")
+def candidate_stream(v: str):
+    """Extrahiert direkte Audio-Stream-URL via yt-dlp für schnelles Vorhören ohne Download"""
+    target = f"https://www.youtube.com/watch?v={v}" if not v.startswith("http") else v
+    try:
+        cmd = ["yt-dlp", "-g", "-f", "ba[ext=m4a]/ba/b", target]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        if res.returncode == 0 and res.stdout.strip():
+            direct_url = res.stdout.strip().splitlines()[0]
+            return RedirectResponse(direct_url)
+    except Exception:
+        pass
+    raise HTTPException(status_code=404, detail="Audio-Stream konnte nicht geladen werden")
+
+
+@app.get("/api/theme-candidates/{item_id}")
+def api_theme_candidates(item_id: str, q: Optional[str] = None):
+    """Liefert die Top 5-8 Theme-Vorschläge inklusive Spürhund-Metadaten für das Auswahl-Modal"""
+    state = load_state()
+    cfg = load_config()
+    item = state["items"].get(item_id)
+    if not item:
+        return {"ok": False, "msg": "Eintrag nicht gefunden", "candidates": []}
+
+    blacklist = state.get("blacklist", {}).get(item_id, [])
+    min_dur = cfg.get("min_duration_sec", 20)
+    max_dur = cfg.get("max_duration_sec", 360)
+
+    st_info = discover_soundtrack_info(item)
+
+    if q and q.strip():
+        search_exprs = [f"ytsearch8:{q.strip()}", f"scsearch5:{q.strip()}"]
+    else:
+        search_exprs = build_search_queries(item)
+
+    all_found = []
+    seen_ids = set()
+
+    if not q and st_info.get("direct_url"):
+        direct_u = st_info["direct_url"]
+        seen_ids.add(direct_u)
+        all_found.append({
+            "id": direct_u,
+            "url": direct_u,
+            "title": f"🎯 [Offiziell] {st_info.get('display') or 'Theme'}",
+            "duration": 180,
+            "duration_str": "~03:00",
+            "uploader": st_info.get("source", "Community-DB")
+        })
+
+    for expr in search_exprs:
+        if expr.startswith("http"):
+            continue
+        cands = find_all_candidates(expr, blacklist, min_dur, max_dur)
+        for c in cands:
+            cid = c.get("id")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                dur = c.get("duration") or 0
+                dur_str = f"{int(dur // 60):02d}:{int(dur % 60):02d}" if dur else "-:--"
+                c["duration_str"] = dur_str
+                all_found.append(c)
+        if len(all_found) >= 6:
+            break
+
+    return {
+        "ok": True,
+        "item_id": item_id,
+        "title": item.get("title", ""),
+        "soundtrack_info": st_info,
+        "candidates": all_found[:8]
+    }
+
+
+@app.get("/api/progress")
+def get_progress():
+    return scan_progress
+
+
+@app.post("/api/cancel")
+def cancel_action():
+    global stop_requested, scan_progress
+    stop_requested = True
+    scan_progress["current_step"] = "Cancelling..."
+    return {"ok": True, "msg": "Cancellation requested"}
+
+
+@app.post("/scan")
+def trigger_scan(
+    scope: str = Form("all"),
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
+    threading.Thread(target=run_scan, kwargs={"scope": scope}, daemon=True).start()
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
+
+@app.post("/download")
+def trigger_download(
+    scope: str = Form("all"),
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
+    threading.Thread(target=run_download_queue, kwargs={"scope": scope}, daemon=True).start()
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
+
+@app.post("/scan-single/{item_id}")
+def scan_single(
+    item_id: str,
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
+    state = load_state()
+    cfg = load_config()
+    item = state["items"].get(item_id)
+    if not item:
+        raise HTTPException(status_code=404)
+
+    theme_exists, actual_dir, mp3_file = check_item_theme(item, cfg=cfg)
+    item["dir"] = actual_dir
+    item["has_theme"] = theme_exists
+    if theme_exists:
+        item["status"] = item.get("video_title") or (mp3_file.name if mp3_file else "Present")
+        if item.get("type") == "Collection" and mp3_file:
+            sync_collection_theme(item, mp3_file, cfg.get("jf_metadata_dir", "/jellyfin-metadata"))
+    else:
+        item["status"] = "Missing"
+
+    state["items"][item_id] = item
+    save_state(state)
+
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
+
+@app.post("/replace/{item_id}")
+def replace_theme(
+    item_id: str,
+    custom_input: str = Form(""),
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
+    state = load_state()
+    cfg = load_config()
+    item = state["items"].get(item_id)
+    if not item:
+        raise HTTPException(status_code=404)
+
+    old_vid = item.get("video_id")
+    if old_vid:
+        bl = state["blacklist"].setdefault(item_id, [])
+        if old_vid not in bl:
+            bl.append(old_vid)
+
+    dl_res = search_and_download(
+        item,
+        custom_query_or_url=custom_input.strip() or None,
+        blacklist=state["blacklist"].get(item_id, []),
+        min_dur=cfg.get("min_duration_sec", 25),
+        max_dur=cfg.get("max_duration_sec", 270),
+        jf_meta_base=cfg.get("jf_metadata_dir", "/jellyfin-metadata"),
+        fade=cfg.get("audio_fade", True)
+    )
+    if dl_res["ok"]:
+        item["has_theme"] = True
+        item["video_id"] = dl_res["video_id"]
+        item["video_title"] = dl_res["video_title"]
+        item["status"] = dl_res["video_title"] or "Heruntergeladen"
+    else:
+        item["status"] = dl_res["msg"]
+
+    state["items"][item_id] = item
+    save_state(state)
+
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
+
+@app.post("/delete/{item_id}")
+def delete_theme(
+    item_id: str,
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
+    state = load_state()
+    item = state["items"].get(item_id)
+    if item:
+        for p in (Path(item.get("dir", "")) / "theme.mp3", LOCAL_THEMES_DIR / item["id"] / "theme.mp3"):
+            p.unlink(missing_ok=True)
+
+        old_vid = item.get("video_id")
+        if old_vid:
+            state["blacklist"].setdefault(item_id, []).append(old_vid)
+        item["has_theme"] = False
+        item["status"] = "Deleted (blocked)"
+        save_state(state)
+
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
+
+class TestJellyfinReq(BaseModel):
+    url: str
+    api_key: str
+
+class TestPlexReq(BaseModel):
+    url: str
+    token: str
+
+class TestFolderReq(BaseModel):
+    paths: str
+
+@app.post("/api/test-jellyfin")
+def api_test_jellyfin(data: TestJellyfinReq):
+    return test_jellyfin_connection(data.url, data.api_key)
+
+@app.post("/api/test-plex")
+def api_test_plex(data: TestPlexReq):
+    return test_plex_connection(data.url, data.token)
+
+@app.post("/api/test-folder")
+def api_test_folder(data: TestFolderReq):
+    return test_folder_path(data.paths)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def get_settings_page():
+    cfg = load_config()
+    return f"""
+    <!doctype html>
+    <html lang="de">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{get_t(cfg, "settings_title")} • Theme Fetcher</title>
+        <style>
+            :root {{
+                --bg: #121417;
+                --card-bg: #181b20;
+                --border: #262a32;
+                --text: #e4e6eb;
+                --text-muted: #9aa0a6;
+                --primary: #2b7de9;
+                --primary-hover: #1b66c9;
+                --success: #28a745;
+                --danger: #c93b3b;
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; max-width: 900px; margin: 0 auto; }}
+            .nav-back {{ margin-bottom: 20px; }}
+            .nav-back a {{ color: var(--text-muted); text-decoration: none; font-size: 0.95rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }}
+            .nav-back a:hover {{ color: #fff; }}
+            h1 {{ margin: 0 0 20px 0; font-size: 1.7rem; }}
+            .card {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 22px; margin-bottom: 20px; }}
+            .card h2 {{ margin-top: 0; font-size: 1.15rem; border-bottom: 1px solid var(--border); padding-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }}
+            .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 14px; }}
+            .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
+            .form-group label {{ font-size: 0.85rem; font-weight: 600; color: var(--text-muted); }}
+            .form-group small {{ font-size: 0.78rem; color: #7d8590; }}
+            input[type="text"], input[type="number"] {{ background: #1e2126; border: 1px solid #343840; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; }}
+            input[type="text"]:focus, input[type="number"]:focus {{ outline: none; border-color: var(--primary); }}
+            .checkbox-group {{ display: flex; align-items: center; gap: 10px; font-size: 0.9rem; margin-top: 6px; }}
+            .checkbox-group input {{ width: 18px; height: 18px; cursor: pointer; }}
+            button, .btn {{ background: var(--primary); color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.95rem; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }}
+            button.test {{ background: #2f3e54; color: #7db2ff; border: 1px solid #415575; font-size: 0.8rem; padding: 6px 12px; }}
+            .test-result {{ margin-top: 6px; font-size: 0.85rem; padding: 8px 12px; border-radius: 4px; display: none; }}
+            .test-result.ok {{ display: block; background: #133824; color: #5ce69a; border: 1px solid #1f5938; }}
+            .test-result.err {{ display: block; background: #421c1c; color: #ff8585; border: 1px solid #6b2d2d; }}
+        </style>
+    </head>
+    <body>
+        <div class="nav-back">
+            <a href="/">{get_t(cfg, "back_to_lib")}</a>
+        </div>
+        <h1>⚙️ {get_t(cfg, "settings_title")}</h1>
+
+        <form method="post" action="/settings">
+            <div class="card">
+                <h2>
+                    <span>{get_t(cfg, "sec_local")}</span>
+                    <button type="button" class="test" onclick="runTestFolder()">{get_t(cfg, "btn_test_path")}</button>
+                </h2>
+                <div class="form-grid">
+                    <div class="form-group" style="grid-column: 1 / -1;">
+                        <label>{get_t(cfg, "lbl_paths")}</label>
+                        <input type="text" id="cfg_paths" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}">
+                        <small>{get_t(cfg, "sub_paths")}</small>
+                        <div id="res_folder" class="test-result"></div>
+                    </div>
+                    <div class="checkbox-group" style="grid-column: 1 / -1;">
+                        <input type="checkbox" id="local_scan_enabled" name="local_scan_enabled" {'checked' if cfg.get('local_scan_enabled', True) else ''}>
+                        <label for="local_scan_enabled">{get_t(cfg, "lbl_local_scan")}</label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>
+                    <span>{get_t(cfg, "sec_servers")}</span>
+                    <div style="display:flex; gap:6px;">
+                        <button type="button" class="test" onclick="runTestJellyfin()">{get_t(cfg, "btn_test_jf")}</button>
+                        <button type="button" class="test" onclick="runTestPlex()">{get_t(cfg, "btn_test_plex")}</button>
+                    </div>
+                </h2>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>{get_t(cfg, "lbl_jf_url")}</label>
+                        <input type="text" id="cfg_jf_url" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}">
+                        <small>Standard-Port: <strong>8096</strong> (z. B. <code>192.168.178.50:8096</code>)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>{get_t(cfg, "lbl_jf_key")}</label>
+                        <input type="text" id="cfg_jf_key" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}">
+                        <small>{get_t(cfg, "sub_jf_key")}</small>
+                    </div>
+                    <div id="res_jf" class="test-result" style="grid-column: 1 / -1;"></div>
+
+                    <div class="form-group">
+                        <label>{get_t(cfg, "lbl_plex_url")}</label>
+                        <input type="text" id="cfg_plex_url" name="plex_url" value="{cfg.get('plex_url', '')}">
+                        <small>Standard-Port: <strong>32400</strong> (z. B. <code>192.168.178.50:32400</code>)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>{get_t(cfg, "lbl_plex_token")}</label>
+                        <input type="text" id="cfg_plex_token" name="plex_token" value="{cfg.get('plex_token', '')}">
+                        <small>{get_t(cfg, "sub_plex_token")}</small>
+                    </div>
+                    <div id="res_plex" class="test-result" style="grid-column: 1 / -1;"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>{get_t(cfg, "sec_audio")}</h2>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>{get_t(cfg, "lbl_min_dur")}</label>
+                        <input type="number" name="min_duration_sec" value="{cfg.get('min_duration_sec', 25)}">
+                        <small>{get_t(cfg, "sub_min_dur")}</small>
+                    </div>
+                    <div class="form-group">
+                        <label>{get_t(cfg, "lbl_max_dur")}</label>
+                        <input type="number" name="max_duration_sec" value="{cfg.get('max_duration_sec', 270)}">
+                        <small>{get_t(cfg, "sub_max_dur")}</small>
+                    </div>
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="audio_fade" name="audio_fade" {'checked' if cfg.get('audio_fade', True) else ''}>
+                        <label for="audio_fade">{get_t(cfg, "lbl_fade")}</label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2><span>{get_t(cfg, "sec_lang")}</span></h2>
+                <div class="form-grid">
+                    <div class="form-group" style="grid-column: 1 / -1;">
+                        <label>{get_t(cfg, "lbl_lang")}</label>
+                        <select name="ui_language" style="padding: 8px 12px; font-size: 0.95rem; width: 220px;">
+                            <option value="de" {'selected' if cfg.get('ui_language', 'de') == 'de' else ''}>🇩🇪 Deutsch (German)</option>
+                            <option value="en" {'selected' if cfg.get('ui_language', 'de') == 'en' else ''}>🇬🇧 English</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <div style="margin-top:20px; display:flex; gap:12px;">
+                <button type="submit" style="background:#28a745; font-size:1.05rem; padding:12px 24px;">{get_t(cfg, "btn_save_settings")}</button>
+                <a href="/" class="btn" style="background:#2a2e36;">{get_t(cfg, "btn_cancel_settings")}</a>
+            </div>
+        </form>
+
+        <script>
+            async function runTestJellyfin() {{
+                const resEl = document.getElementById('res_jf');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Testing connection to Jellyfin...';
+                
+                const url = document.getElementById('cfg_jf_url').value;
+                const apiKey = document.getElementById('cfg_jf_key').value;
+
+                try {{
+                    const resp = await fetch('/api/test-jellyfin', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ url: url, api_key: apiKey }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Request failed: ' + e;
+                }}
+            }}
+
+            async function runTestPlex() {{
+                const resEl = document.getElementById('res_plex');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Testing connection to Plex...';
+                
+                const url = document.getElementById('cfg_plex_url').value;
+                const token = document.getElementById('cfg_plex_token').value;
+
+                try {{
+                    const resp = await fetch('/api/test-plex', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ url: url, token: token }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Request failed: ' + e;
+                }}
+            }}
+
+            async function runTestFolder() {{
+                const resEl = document.getElementById('res_folder');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Testing container media path...';
+                
+                const paths = document.getElementById('cfg_paths').value;
+
+                try {{
+                    const resp = await fetch('/api/test-folder', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ paths: paths }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Request failed: ' + e;
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+
+@app.post("/settings")
+def update_settings(
+    local_media_paths: str = Form("/media"),
+    local_scan_enabled: Optional[str] = Form(None),
+    jellyfin_url: str = Form(""),
+    jellyfin_api_key: str = Form(""),
+    plex_url: str = Form(""),
+    plex_token: str = Form(""),
+    min_duration_sec: int = Form(25),
+    max_duration_sec: int = Form(270),
+    audio_fade: Optional[str] = Form(None),
+    ui_language: str = Form("de"),
+    scan_interval_hours: int = Form(12)
+):
+    cfg = load_config()
+    cfg["local_media_paths"] = local_media_paths.strip()
+    cfg["local_scan_enabled"] = bool(local_scan_enabled)
+    cfg["jellyfin_url"] = clean_url_input(jellyfin_url)
+    cfg["jellyfin_api_key"] = jellyfin_api_key.strip()
+    cfg["plex_url"] = clean_url_input(plex_url)
+    cfg["plex_token"] = plex_token.strip()
+    cfg["min_duration_sec"] = min_duration_sec
+    cfg["max_duration_sec"] = max_duration_sec
+    cfg["audio_fade"] = bool(audio_fade)
+    cfg["ui_language"] = ui_language.strip() or "de"
+    cfg["scan_interval_hours"] = scan_interval_hours
+
+    save_config(cfg)
+    threading.Thread(target=run_scan, kwargs={"scope": "all"}, daemon=True).start()
+    return RedirectResponse("/?settings=saved", status_code=303)
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings: str = ""):
+    cfg = load_config()
+    state = load_state()
+    all_items = list(state["items"].values())
+
+    clean_tab = normalize_tab(tab)
+
+    total_filme = sum(1 for i in all_items if i.get("type") == "Film")
+    filme_ok = sum(1 for i in all_items if i.get("type") == "Film" and i.get("has_theme"))
+    filme_miss = total_filme - filme_ok
+
+    total_serien = sum(1 for i in all_items if i.get("type") == "Serie")
+    serien_ok = sum(1 for i in all_items if i.get("type") == "Serie" and i.get("has_theme"))
+    serien_miss = total_serien - serien_ok
+
+    total_cols = sum(1 for i in all_items if i.get("type") == "Collection")
+    cols_ok = sum(1 for i in all_items if i.get("type") == "Collection" and i.get("has_theme"))
+    cols_miss = total_cols - cols_ok
+
+    scanned_folders = state.get("folders", [])
+
+    type_map = {"movies": "Film", "shows": "Serie", "collections": "Collection", "filme": "Film", "serien": "Serie"}
+    current_scope = type_map.get(clean_tab, "Film")
+
+    tab_items = [i for i in all_items if i.get("type") == current_scope]
+    tab_total = len(tab_items)
+    tab_ok = sum(1 for i in tab_items if i.get("has_theme"))
+    tab_miss = tab_total - tab_ok
+
+    items = tab_items
+    if q:
+        items = [
+            i for i in items
+            if q.lower() in i.get("title", "").lower() or q.lower() in (i.get("original_title") or "").lower()
+        ]
+    if filter_status == "missing":
+        items = [i for i in items if not i.get("has_theme")]
+    elif filter_status == "ok":
+        items = [i for i in items if i.get("has_theme")]
+
+    items.sort(key=lambda x: (x.get("has_theme", False), x.get("title", "").lower()))
+    st_cache = state.get("soundtrack_cache", {})
+
+    rows = ""
+    for it in items:
+        iid = it["id"]
+        has_theme = bool(it.get("has_theme"))
+        st_hint = ""
+        c_info = st_cache.get(iid)
+        if c_info and c_info.get("display"):
+            st_hint = f"<div style='font-size:0.75rem; color:#7db2ff; margin-top:2px;'>🎯 {c_info['display']} <span style='color:#8b929a;'>({c_info.get('source')})</span></div>"
+        orig_hint = (
+            f" <small style='color:#7d8590;'>[{it['original_title']}]</small>"
+            if it.get("original_title") and it["original_title"].lower() != it["title"].lower()
+            else ""
+        )
+
+        badge = (
+            '<span class="badge ok">{get_t(cfg, "status_present")}</span>'
+            if has_theme
+            else '<span class="badge miss">{get_t(cfg, "status_missing")}</span>'
+        )
+        player = (
+            f'<audio controls preload="none" src="/audio/{iid}?t={int(time.time())}"></audio>'
+            if has_theme
+            else "-"
+        )
+
+        if has_theme:
+            v_title = it.get("video_title") or it.get("status") or "theme.mp3"
+            sub_info = f"<div style='font-size:0.75rem; color:#5ce69a; margin-top:3px;'>🎵 {v_title}</div>"
+        else:
+            err_msg = it.get("status") or ""
+            if err_msg and err_msg not in ("Fehlt", "Missing", "Vorhanden", "Present"):
+                sub_info = f"<div style='font-size:0.75rem; color:#ff8585; margin-top:3px;'>⚠️ {err_msg}</div>"
+            else:
+                sub_info = ""
+
+        rows += f"""
+        <tr id="row_{iid}">
+            <td style="width: 50px; padding: 6px;">
+                <img src="/poster/{iid}" style="width: 44px; height: 64px; object-fit: cover; border-radius: 4px; display: block;" loading="lazy" alt="Cover">
+            </td>
+            <td>
+                <strong>{it['title']}</strong>{orig_hint} <small>({it.get('year') or '-'})</small><br>
+                <span class="meta">{it['source']} • <code>{it.get('dir')}</code></span>
+                {st_hint}
+            </td>
+            <td>
+                <div id="status_box_{iid}">
+                    {badge}
+                    {sub_info}
+                </div>
+            </td>
+            <td>{player}</td>
+            <td style="white-space: nowrap;">
+                <div style="display:inline-flex; gap:4px; align-items:center;">
+                    <button type="button" class="btn-sm" style="background:#5c3b99;" onclick="openThemeModal('{iid}')" title="{get_t(cfg, 'btn_select_title')}">{get_t(cfg, "btn_select")}</button>
+                    <form method="post" action="/replace/{iid}" class="inline-form" onsubmit="this.querySelector('button').innerText='⏳';">
+                        <input type="hidden" name="tab" value="{clean_tab}">
+                        <input type="hidden" name="filter_status" value="{filter_status}">
+                        <input type="hidden" name="q" value="{q}">
+                        <input type="text" name="custom_input" placeholder="{get_t(cfg, 'btn_dl_placeholder')}" style="width:115px; font-size:0.8rem; padding:4px 6px;">
+                        <button type="submit" class="btn-sm" title="{get_t(cfg, 'btn_dl_title')}">▶️</button>
+                    </form>
+                    <form method="post" action="/scan-single/{iid}" style="display:inline;" onsubmit="this.querySelector('button').innerText='⏳';">
+                        <input type="hidden" name="tab" value="{clean_tab}">
+                        <input type="hidden" name="filter_status" value="{filter_status}">
+                        <input type="hidden" name="q" value="{q}">
+                        <button type="submit" class="btn-sm secondary" title="{get_t(cfg, 'btn_recheck_title')}">🔄</button>
+                    </form>
+                    <form method="post" action="/delete/{iid}" style="display:inline;" onsubmit="return confirm('{del_confirm_msg}');">
+                        <input type="hidden" name="tab" value="{clean_tab}">
+                        <input type="hidden" name="filter_status" value="{filter_status}">
+                        <input type="hidden" name="q" value="{q}">
+                        <button type="submit" class="btn-sm danger" title="{get_t(cfg, 'btn_delete_title')}">✕</button>
+                    </form>
+                </div>
+            </td>
+            <td style="min-width: 140px; font-size: 0.8rem;" id="prog_col_{iid}">
+                <div id="prog_bar_box_{iid}" style="display:none;">
+                    <div style="background:#262a32; height:8px; border-radius:4px; overflow:hidden; margin-bottom:4px;">
+                        <div id="prog_bar_fill_{iid}" style="background:#28a745; height:100%; width:0%; transition:width 0.3s;"></div>
+                    </div>
+                    <span id="prog_bar_txt_{iid}" style="color:#7db2ff; font-size:0.75rem;">Processing...</span>
+                </div>
+                <span id="prog_static_{iid}" style="color:#7d8590;">{'✓ Ready' if has_theme else 'Missing'}</span>
+            </td>
+        </tr>
+        """
+
+    saved_banner = f'<div class="banner">{get_t(cfg, "settings_saved_banner")}</div>' if settings == "saved" else ""
+    folder_list_html = "".join(f"<li style='margin-bottom:6px;'><code>{f}</code></li>" for f in scanned_folders) or "<li>{lib_empty_placeholder}</li>"
+
+    scope_label = "Movies" if current_scope == "Film" else ("TV Shows" if current_scope == "Serie" else "Collections")
+
+    return f"""
+    <!doctype html>
+    <html lang="de">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Theme Fetcher</title>
+        <style>
+            :root {{
+                --bg: #121417;
+                --card-bg: #181b20;
+                --border: #262a32;
+                --text: #e4e6eb;
+                --text-muted: #9aa0a6;
+                --primary: #2b7de9;
+                --primary-hover: #1b66c9;
+                --danger: #c93b3b;
+                --success: #28a745;
+                --success-bg: #1d4d32;
+                --success-text: #5ce69a;
+                --miss-bg: #4d2323;
+                --miss-text: #ff7b7b;
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }}
+            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 14px; }}
+            h1 {{ margin: 0; font-size: 1.6rem; letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; }}
+            .stats {{ color: var(--text-muted); font-size: 0.95rem; margin-top: 4px; }}
+            button, .btn {{ background: var(--primary); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 0.9rem; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }}
+            button:hover, .btn:hover {{ background: var(--primary-hover); }}
+            button.secondary, .btn.secondary {{ background: #2a2e36; color: var(--text); }}
+            button.secondary:hover, .btn.secondary:hover {{ background: #353b45; }}
+            button.success, .btn.success {{ background: var(--success); }}
+            button.success:hover, .btn.success:hover {{ background: #218838; }}
+            button.danger, .btn.danger {{ background: var(--danger); }}
+            button.danger:hover, .btn.danger:hover {{ background: #a82e2e; }}
+            .btn-sm {{ padding: 4px 8px; font-size: 0.8rem; border-radius: 4px; }}
+            input[type="text"], input[type="number"], select {{ background: #1e2126; border: 1px solid #343840; color: #fff; padding: 7px 10px; border-radius: 6px; font-size: 0.85rem; }}
+            input[type="text"]:focus, select:focus {{ outline: none; border-color: var(--primary); }}
+            table {{ width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; margin-top: 10px; }}
+            th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }}
+            th {{ background: #1f2329; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }}
+            .meta {{ font-size: 0.75rem; color: #8b929a; }}
+            .badge {{ padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; display:inline-block; }}
+            .badge.ok {{ background: var(--success-bg); color: var(--success-text); }}
+            .badge.miss {{ background: var(--miss-bg); color: var(--miss-text); }}
+            .inline-form {{ display: inline-flex; gap: 4px; }}
+            audio {{ height: 32px; width: 190px; }}
+            .banner {{ background: #1d4d32; color: #5ce69a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-weight: 500; }}
+            
+            /* PROGRESS & QUEUE CARD */
+            .progress-card {{ background: var(--card-bg); border: 1px solid #344256; border-radius: 8px; padding: 16px; margin-bottom: 18px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }}
+            .progress-bar-bg {{ background: #262a32; height: 14px; border-radius: 7px; overflow: hidden; margin: 10px 0; }}
+            .progress-bar-fill {{ background: #28a745; height: 100%; width: 0%; transition: width 0.3s ease; }}
+            .queue-box {{ background: #131519; border: 1px solid #232730; border-radius: 6px; padding: 10px; margin-top: 12px; font-size: 0.85rem; }}
+            
+            /* TABS */
+            .tab-nav {{ display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 8px; flex-wrap: wrap; }}
+            .tab-btn {{ background: transparent; color: var(--text-muted); border: 1px solid transparent; padding: 8px 16px; border-radius: 6px; font-size: 0.95rem; cursor: pointer; text-decoration: none; font-weight: 600; }}
+            .tab-btn:hover {{ background: #20242b; color: #fff; }}
+            .tab-btn.active {{ background: #2b7de9; color: #fff; }}
+            
+            /* FILTER PILLS */
+            .pill-filter {{ display: flex; gap: 8px; align-items: center; flex-wrap:wrap; }}
+            .pill {{ background: #20242b; color: var(--text-muted); border: 1px solid #2d323b; padding: 5px 12px; border-radius: 20px; font-size: 0.85rem; text-decoration: none; font-weight: 500; cursor: pointer; }}
+            .pill:hover {{ color: #fff; border-color: #3f4552; }}
+            .pill.active {{ background: #2b7de9; color: #fff; border-color: #2b7de9; }}
+            .pill.miss.active {{ background: #c93b3b; color: #fff; border-color: #c93b3b; }}
+            .pill.ok.active {{ background: #28a745; color: #fff; border-color: #28a745; }}
+
+            /* MODAL DIALOG */
+            .modal-backdrop {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.75); display: none; align-items: center; justify-content: center; z-index: 1000; }}
+            .modal {{ background: var(--card-bg); border: 1px solid #343b47; border-radius: 10px; width: 92%; max-width: 680px; padding: 22px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); max-height: 90vh; overflow-y: auto; }}
+            .modal h2 {{ margin-top: 0; font-size: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }}
+            .modal-close {{ background: transparent; color: var(--text-muted); border: none; font-size: 1.4rem; cursor: pointer; padding: 0 4px; }}
+            .modal-close:hover {{ color: #fff; }}
+            .candidate-row {{ background: #121417; border: 1px solid #282d37; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div>
+                <h1>🎵 Theme Fetcher</h1>
+                <div class="stats">{get_t(cfg, "movies")}: {filme_ok}/{total_filme} • {get_t(cfg, "shows")}: {serien_ok}/{total_serien} • {get_t(cfg, "collections")}: {cols_ok}/{total_cols}</div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <a href="/settings" class="btn secondary">⚙️ {get_t(cfg, "settings")}</a>
+
+                <form method="post" action="/scan" style="display:inline;">
+                    <input type="hidden" name="scope" value="{current_scope}">
+                    <input type="hidden" name="tab" value="{clean_tab}">
+                    <input type="hidden" name="filter_status" value="{filter_status}">
+                    <input type="hidden" name="q" value="{q}">
+                    <button type="submit">{get_t(cfg, "scan_only", scope=scope_label)}</button>
+                </form>
+
+                <form method="post" action="/scan" style="display:inline;">
+                    <input type="hidden" name="scope" value="all">
+                    <input type="hidden" name="tab" value="{clean_tab}">
+                    <input type="hidden" name="filter_status" value="{filter_status}">
+                    <input type="hidden" name="q" value="{q}">
+                    <button type="submit" class="secondary">{get_t(cfg, "scan_all")}</button>
+                </form>
+
+                <form method="post" action="/download" style="display:inline;">
+                    <input type="hidden" name="scope" value="{current_scope}">
+                    <input type="hidden" name="tab" value="{clean_tab}">
+                    <input type="hidden" name="filter_status" value="{filter_status}">
+                    <input type="hidden" name="q" value="{q}">
+                    <button type="submit" class="success">{get_t(cfg, "download_missing", scope=scope_label, count=tab_miss)}</button>
+                </form>
+
+                <button type="button" id="btnCancel" class="danger" style="display:none;" onclick="cancelRunningAction()">{get_t(cfg, "cancel")}</button>
+            </div>
+        </div>
+
+        {saved_banner}
+
+        <!-- LIVE FORTSCHRITTS- & WARTESCHLANGEN-KARTE -->
+        <div id="progressCard" class="progress-card" style="display:none;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <strong id="progStep" style="font-size:1.05rem;">{get_t(cfg, "op_in_progress")}</strong>
+                <span id="progCount" style="color:var(--text-muted); font-size:0.95rem; font-weight:600;">0 / 0</span>
+            </div>
+            <div class="progress-bar-bg">
+                <div id="progFill" class="progress-bar-fill"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:0.85rem; color:var(--text-muted);">
+                <span id="progItem">{get_t(cfg, "processing")}</span>
+                <span>{get_t(cfg, "downloaded_stat")}: <strong id="progDown" style="color:#5ce69a;">0</strong> | {get_t(cfg, "failed_stat")}: <strong id="progFail" style="color:#ff8585;">0</strong></span>
+            </div>
+
+            <div id="queueBox" class="queue-box" style="display:none;">
+                <div style="font-weight:600; margin-bottom:6px; color:#7db2ff;">{get_t(cfg, "next_in_queue")}</div>
+                <div id="queueList" style="color:var(--text-muted); font-size:0.8rem; margin-bottom:10px;">-</div>
+                <div style="font-weight:600; margin-bottom:4px; color:#5ce69a;">{get_t(cfg, "recently_finished")}</div>
+                <div id="recentList" style="font-size:0.8rem;">-</div>
+            </div>
+        </div>
+
+        <!-- REITER / TABS -->
+        <div class="tab-nav">
+            <a href="/?tab=movies&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab in ('movies', 'filme') else ''}">🎬 {get_t(cfg, "movies")} ({filme_ok}/{total_filme})</a>
+            <a href="/?tab=shows&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab in ('shows', 'serien') else ''}">📺 {get_t(cfg, "shows")} ({serien_ok}/{total_serien})</a>
+            <a href="/?tab=collections&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='collections' else ''}">📁 {get_t(cfg, "collections")} ({cols_ok}/{total_cols})</a>
+            <a href="/?tab=libraries" class="tab-btn {'active' if clean_tab in ('libraries', 'ordner') else ''}">📂 {get_t(cfg, "libraries")} ({len(scanned_folders)})</a>
+        </div>
+
+        {'<!-- ORDNER TAB -->' if clean_tab in ('libraries', 'ordner') else ''}
+        <div style="display: {'block' if clean_tab in ('libraries', 'ordner') else 'none'}; background:var(--card-bg); padding:20px; border-radius:8px;">
+            <h3 style="margin-top:0;">{get_t(cfg, "lib_title")}</h3>
+            <p style="color:var(--text-muted); font-size:0.9rem;">{get_t(cfg, "lib_desc")}</p>
+            <ul style="line-height:1.8; font-size:0.95rem;">
+                {folder_list_html}
+            </ul>
+        </div>
+
+        <!-- FILTER-LEISTE & TABELLE -->
+        <div style="display: {'none' if clean_tab in ('libraries', 'ordner') else 'block'};">
+            <div style="background:var(--card-bg); padding:12px; border-radius:8px; margin-bottom:14px; display:flex; gap:14px; align-items:center; justify-content:space-between; flex-wrap:wrap;">
+                
+                <div class="pill-filter">
+                    <span style="font-size:0.85rem; color:var(--text-muted); margin-right:4px;">{get_t(cfg, "filter_label")}</span>
+                    <a href="/?tab={clean_tab}&filter_status=all{f'&q={q}' if q else ''}" class="pill {'active' if filter_status=='all' else ''}">{get_t(cfg, "all_pill", count=tab_total)}</a>
+                    <a href="/?tab={clean_tab}&filter_status=missing{f'&q={q}' if q else ''}" class="pill miss {'active' if filter_status=='missing' else ''}">{get_t(cfg, "missing_pill", count=tab_miss)}</a>
+                    <a href="/?tab={clean_tab}&filter_status=ok{f'&q={q}' if q else ''}" class="pill ok {'active' if filter_status=='ok' else ''}">{get_t(cfg, "present_pill", count=tab_ok)}</a>
+                </div>
+
+                <form method="get" action="/" style="display:flex; gap:6px; align-items:center;">
+                    <input type="hidden" name="tab" value="{clean_tab}">
+                    <input type="hidden" name="filter_status" value="{filter_status}">
+                    <input type="text" name="q" value="{q}" placeholder="{get_t(cfg, 'search_placeholder', scope=scope_label)}" style="width:200px;">
+                    <button type="submit" class="btn-sm">{get_t(cfg, "search_btn")}</button>
+                    {f'<a href="/?tab={clean_tab}&filter_status={filter_status}" class="btn-sm secondary">✕</a>' if q else ''}
+                </form>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:50px;">{get_t(cfg, "th_cover")}</th>
+                        <th>{get_t(cfg, "th_title_path")}</th>
+                        <th>{get_t(cfg, "th_status")}</th>
+                        <th>{get_t(cfg, "th_preview")}</th>
+                        <th>{get_t(cfg, "th_actions")}</th>
+                        <th>{get_t(cfg, "th_progress")}</th>
+                    </tr>
+                </thead>
+                <tbody>{rows or f'<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--text-muted);">{get_t(cfg, "no_entries", scope=scope_label)}</td></tr>'}</tbody>
+            </table>
+        </div>
+
+        <!-- THEME AUSWAHL-MODAL -->
+        <div id="themeModal" class="modal-backdrop">
+            <div class="modal">
+                <h2>
+                    <span id="themeModalTitle">{get_t(cfg, "modal_title", title="")}</span>
+                    <button class="modal-close" onclick="closeModal('themeModal')">&times;</button>
+                </h2>
+                
+                <div id="themeSpuerhundBanner" style="display:none; background:#192636; border:1px solid #2b4566; color:#7db2ff; padding:8px 12px; border-radius:6px; margin: 10px 0; font-size:0.85rem;"></div>
+
+                <div style="display:flex; gap:6px; margin: 12px 0 16px 0;">
+                    <input type="text" id="themeSearchInput" placeholder="{get_t(cfg, 'modal_search_placeholder')}" style="flex:1;">
+                    <button type="button" class="btn-sm" onclick="fetchCandidates()">{get_t(cfg, "modal_search_btn")}</button>
+                </div>
+
+                <div id="themeModalLoading" style="padding:25px; text-align:center; color:var(--text-muted);">
+                    Suche Soundtrack-Kandidaten auf YouTube & SoundCloud...
+                </div>
+
+                <div id="themeModalList" style="display:none;"></div>
+            </div>
+        </div>
+
+        <script>
+            let currentModalItemId = null;
+
+            // Audio-Autostopp & 50% Standard-Lautstärke
+            document.addEventListener('play', function(e){{
+                e.target.volume = 0.5; // Angenehme Standard-Lautstärke
+                var audios = document.getElementsByTagName('audio');
+                for(var i = 0, len = audios.length; i < len; i++){{
+                    if(audios[i] != e.target){{
+                        audios[i].pause();
+                    }}
+                }}
+            }}, true);
+
+            function closeModal(id) {{
+                // Pausiere alle Audios im Modal
+                const modal = document.getElementById(id);
+                if (modal) {{
+                    const audios = modal.getElementsByTagName('audio');
+                    for (let a of audios) a.pause();
+                    modal.style.display = 'none';
+                }}
+            }}
+
+            async function openThemeModal(itemId) {{
+                currentModalItemId = itemId;
+                const modal = document.getElementById('themeModal');
+                const row = document.getElementById('row_' + itemId);
+                const titleStr = row ? row.querySelector('strong').innerText : 'Titel';
+
+                document.getElementById('themeModalTitle').innerText = '{get_t(cfg, "btn_select")}: ' + titleStr;
+                document.getElementById('themeSearchInput').value = '';
+                modal.style.display = 'flex';
+
+                await fetchCandidates();
+            }}
+
+            async function fetchCandidates() {{
+                const loading = document.getElementById('themeModalLoading');
+                const list = document.getElementById('themeModalList');
+                const q = document.getElementById('themeSearchInput').value;
+
+                loading.style.display = 'block';
+                list.style.display = 'none';
+                list.innerHTML = '';
+
+                try {{
+                    const url = '/api/theme-candidates/' + currentModalItemId + (q ? ('?q=' + encodeURIComponent(q)) : '');
+                    const resp = await fetch(url);
+                    const data = await resp.json();
+
+                    loading.style.display = 'none';
+                    list.style.display = 'block';
+
+                    const banner = document.getElementById('themeSpuerhundBanner');
+                    if (data.soundtrack_info && data.soundtrack_info.display) {{
+                        banner.style.display = 'block';
+                        banner.innerHTML = '🎯 <strong>Erkannter Soundtrack:</strong> ' + data.soundtrack_info.display + ' <span style="color:#8b929a;">(Quelle: ' + data.soundtrack_info.source + ')</span>';
+                        if (!q && !document.getElementById('themeSearchInput').value) {{
+                            document.getElementById('themeSearchInput').value = data.soundtrack_info.display;
+                        }}
+                    }}
+
+                    if (!data.ok || !data.candidates || data.candidates.length === 0) {{
+                        list.innerHTML = '<div style=\"text-align:center; padding:20px; color:var(--text-muted);\">No matching soundtracks found. Try a different search query above!</div>';
+                        return;
+                    }}
+
+                    list.innerHTML = data.candidates.map(c => `
+                        <div class="candidate-row">
+                            <div style="flex:1; min-width:200px;">
+                                <div style="font-weight:600; font-size:0.9rem; color:#e4e6eb;">${{c.title}}</div>
+                                <div style="font-size:0.75rem; color:#8b929a; margin-top:2px;">
+                                    ${{c.uploader ? (c.uploader + ' • ') : ''}}{get_t(cfg, "modal_length")}${{c.duration_str}}
+                                    • <a href="${{c.url}}" target="_blank" rel="noopener" style="color:#7db2ff; text-decoration:none;">{get_t(cfg, "modal_open_yt")}</a>
+                                </div>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <audio controls preload="none" src="/api/candidate-stream?v=${{encodeURIComponent(c.id)}}" style="width:160px; height:30px;"></audio>
+                                <button type="button" class="btn-sm success" onclick="applyCandidateTheme('${{currentModalItemId}}', '${{c.url}}')">{get_t(cfg, "modal_apply")}</button>
+                            </div>
+                        </div>
+                    `).join('');
+
+                }} catch (e) {{
+                    loading.style.display = 'none';
+                    list.style.display = 'block';
+                    list.innerHTML = '<div style=\"color:#ff8585; padding:15px;\">Search error: ' + e + '</div>';
+                }}
+            }}
+
+            async function applyCandidateTheme(itemId, customUrl) {{
+                const modal = document.getElementById('themeModal');
+                closeModal('themeModal');
+
+                const form = document.createElement('form');
+                form.method = 'POST';
+                form.action = '/replace/' + itemId;
+                
+                const inpTab = document.createElement('input');
+                inpTab.type = 'hidden';
+                inpTab.name = 'tab';
+                inpTab.value = '{clean_tab}';
+                form.appendChild(inpTab);
+
+                const inpFilter = document.createElement('input');
+                inpFilter.type = 'hidden';
+                inpFilter.name = 'filter_status';
+                inpFilter.value = '{filter_status}';
+                form.appendChild(inpFilter);
+
+                const inpQ = document.createElement('input');
+                inpQ.type = 'hidden';
+                inpQ.name = 'q';
+                inpQ.value = '{q}';
+                form.appendChild(inpQ);
+
+                const inpUrl = document.createElement('input');
+                inpUrl.type = 'hidden';
+                inpUrl.name = 'custom_input';
+                inpUrl.value = customUrl;
+                form.appendChild(inpUrl);
+
+                document.body.appendChild(form);
+                form.submit();
+            }}
+
+            async function cancelRunningAction() {{
+                try {{
+                    await fetch('/api/cancel', {{ method: 'POST' }});
+                    document.getElementById('progStep').innerText = 'Abbruch angefordert...';
+                }} catch (e) {{}}
+            }}
+
+            async function pollProgress() {{
+                try {{
+                    const resp = await fetch('/api/progress');
+                    const data = await resp.json();
+                    const card = document.getElementById('progressCard');
+                    const cancelBtn = document.getElementById('btnCancel');
+                    const qBox = document.getElementById('queueBox');
+                    
+                    if (data.is_running) {{
+                        card.style.display = 'block';
+                        cancelBtn.style.display = 'inline-flex';
+                        document.getElementById('progStep').innerText = (data.action_type === 'download' ? '⬇️ ' : '🔍 ') + data.current_step;
+                        document.getElementById('progCount').innerText = data.processed + ' / ' + data.total + ' (' + data.percent + '%)';
+                        document.getElementById('progFill').style.width = data.percent + '%';
+                        document.getElementById('progItem').innerText = data.current_item_title || '';
+                        document.getElementById('progDown').innerText = data.new_downloaded;
+                        document.getElementById('progFail').innerText = data.failed;
+
+                        // Tabellen-Fortschrittsbalken pro Zeile
+                        if (data.current_item_id) {{
+                            const barBox = document.getElementById('prog_bar_box_' + data.current_item_id);
+                            const barFill = document.getElementById('prog_bar_fill_' + data.current_item_id);
+                            const barTxt = document.getElementById('prog_bar_txt_' + data.current_item_id);
+                            const barStatic = document.getElementById('prog_static_' + data.current_item_id);
+                            
+                            if (barBox && barFill && barTxt) {{
+                                barBox.style.display = 'block';
+                                if (barStatic) barStatic.style.display = 'none';
+                                const itemInfo = (data.item_status && data.item_status[data.current_item_id]) || {{}};
+                                const pct = itemInfo.percent || 50;
+                                barFill.style.width = pct + '%';
+                                barTxt.innerText = itemInfo.step || 'Lädt Theme...';
+                            }}
+                        }}
+
+                        if (data.action_type === 'download') {{
+                            qBox.style.display = 'block';
+                            if (data.queue && data.queue.length > 0) {{
+                                document.getElementById('queueList').innerText = data.queue.slice(0, 6).join(' • ') + (data.queue.length > 6 ? ' ... (+' + (data.queue.length - 6) + ' weitere)' : '');
+                            }} else {{
+                                document.getElementById('queueList').innerText = '{get_t(cfg, "no_more_queue")}';
+                            }}
+
+                            if (data.recent_finished && data.recent_finished.length > 0) {{
+                                document.getElementById('recentList').innerHTML = data.recent_finished.slice(0, 4).map(r => 
+                                    '<div style=\"color:' + (r.ok ? '#5ce69a' : '#ff8585') + '; margin-bottom:2px;\">' + (r.ok ? '✓ ' : '✕ ') + '<strong>' + r.title + '</strong>: ' + r.msg + '</div>'
+                                ).join('');
+                            }}
+                        }} else {{
+                            qBox.style.display = 'none';
+                        }}
+                    }} else {{
+                        cancelBtn.style.display = 'none';
+                        if (data.processed > 0 && data.processed === data.total) {{
+                            card.style.display = 'block';
+                            document.getElementById('progStep').innerText = data.current_step;
+                            document.getElementById('progFill').style.width = '100%';
+                            document.getElementById('progDown').innerText = data.new_downloaded;
+                            document.getElementById('progFail').innerText = data.failed;
+                        }}
+                    }}
+                }} catch (e) {{}}
+            }}
+
+            setInterval(pollProgress, 1200);
+            pollProgress();
+        </script>
+    </body>
+    </html>
+    """
