@@ -11,13 +11,18 @@ from typing import List, Optional, Tuple, Dict
 from fastapi import FastAPI, Form, HTTPException, Response
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
-from PIL import Image
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 app = FastAPI(title="Theme Fetcher")
 
 DATA_DIR = Path("/data")
 COLLECTIONS_DIR = DATA_DIR / "collections"
 LOCAL_THEMES_DIR = DATA_DIR / "local_themes"
+POSTERS_DIR = DATA_DIR / "posters"
+POSTERS_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = DATA_DIR / "config.json"
 STATE_FILE = DATA_DIR / "state.json"
 
@@ -39,7 +44,7 @@ DEFAULT_CONFIG = {
     "audio_fade": True,
     "embed_cover": True,
     "auto_download": False,
-    "ui_language": "de"
+    "ui_language": "en"
 }
 
 EXCLUDE_KEYWORDS = [
@@ -137,6 +142,8 @@ LANG_PACK = {
         "modal_open_yt": "Auf YouTube öffnen ↗",
         "modal_length": "Länge: ",
         "modal_apply": "✓ Übernehmen",
+        "modal_seek_mid": "⏩ Mitte",
+        "modal_seek_title": "Zur Mitte springen (50%)",
         "settings_saved_banner": "✓ Einstellungen erfolgreich gespeichert!",
         "sec_local": "📁 1. Lokale Medienquellen (Festplatte)",
         "btn_test_path": "📂 Pfad testen",
@@ -147,11 +154,11 @@ LANG_PACK = {
         "btn_test_jf": "🔌 Jellyfin testen",
         "btn_test_plex": "🍿 Plex testen",
         "lbl_jf_url": "Jellyfin Server-IP & Port",
-        "sub_jf_url": "Standard-Port: <strong>8096</strong> (z. B. <code>192.168.178.50:8096</code>)",
+        "sub_jf_url": "Standard-Port: <strong>8096</strong> (z. B. <code>192.168.1.50:8096</code>)",
         "lbl_jf_key": "Jellyfin API-Key",
         "sub_jf_key": "Erstellt unter Jellyfin: Dashboard ➔ API-Schlüssel",
         "lbl_plex_url": "Plex Server-IP & Port (Optional)",
-        "sub_plex_url": "Standard-Port: <strong>32400</strong> (z. B. <code>192.168.178.50:32400</code>)",
+        "sub_plex_url": "Standard-Port: <strong>32400</strong> (z. B. <code>192.168.1.50:32400</code>)",
         "lbl_plex_token": "Plex Token (Optional)",
         "sub_plex_token": "Dein persönlicher X-Plex-Token",
         "sec_audio": "⚡ 3. Download-Kriterien & Audio-Veredelung",
@@ -248,6 +255,8 @@ LANG_PACK = {
         "modal_open_yt": "Open on YouTube ↗",
         "modal_length": "Length: ",
         "modal_apply": "✓ Apply",
+        "modal_seek_mid": "⏩ Mid",
+        "modal_seek_title": "Jump to middle (50%)",
         "settings_saved_banner": "✓ Settings saved successfully!",
         "sec_local": "📁 1. Local Media Storage (Hard Drives & Mounts)",
         "btn_test_path": "📂 Test Path",
@@ -386,17 +395,32 @@ def find_theme_file_in_dir(d: Path) -> Optional[Path]:
     return None
 
 
-def find_local_cover_image(d: Path, title: str = "") -> Optional[Path]:
-    """Erkennt Film-/Serienplakate tolerant nach Namen & prüft Hochformat (Aspect Ratio)"""
+def find_local_cover_image(d: Path, title: str = "", raw_path_str: str = "") -> Optional[Path]:
+    """Tolerante Cover-Erkennung: Prüft Verzeichnis, Dateinamen des Films und typische Plakat-Muster"""
+    img_exts = {".jpg", ".jpeg", ".png", ".webp"}
+
+    # Prüfe zuerst direkt neben der Videodatei (z. B. Inception-poster.jpg oder Inception.jpg)
+    if raw_path_str:
+        try:
+            rp = Path(raw_path_str)
+            base_dir = rp.parent if rp.is_file() or rp.suffix else rp
+            if base_dir.exists() and base_dir.is_dir():
+                stem = rp.stem.lower()
+                for ext in img_exts:
+                    for suffix in ("-poster", ".poster", "-cover", ""):
+                        candidate = base_dir / f"{rp.stem}{suffix}{ext}"
+                        if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 1000:
+                            return candidate
+        except Exception:
+            pass
+
     if not d.exists() or not d.is_dir():
         return None
 
-    img_exts = {".jpg", ".jpeg", ".png", ".webp"}
     candidates = []
-
     try:
         for f in d.iterdir():
-            if f.is_file() and f.suffix.lower() in img_exts:
+            if f.is_file() and f.suffix.lower() in img_exts and f.stat().st_size > 1000:
                 candidates.append(f)
     except Exception:
         return None
@@ -406,43 +430,43 @@ def find_local_cover_image(d: Path, title: str = "") -> Optional[Path]:
 
     title_slug = slugify(title) if title else ""
 
-    # 1. Bevorzuge typische Plakat-Namen
+    # 1. Bevorzuge typische Plakat-Namen (Kodi, Plex, Jellyfin Standard)
     for f in candidates:
         fname = f.stem.lower()
-        if fname in ("poster", "folder", "cover", "front", "default", "show"):
+        if fname in ("poster", "folder", "cover", "front", "default", "show", "movie"):
             return f
-        if "poster" in fname or "cover" in fname or "front" in fname:
+        if "poster" in fname or "cover" in fname or "folder" in fname or "front" in fname:
             return f
         if title_slug and title_slug in slugify(fname):
             return f
 
-    # 2. Metadaten-Check mit Pillow: Plakate sind Hochformat (Höhe > Breite)
+    # 2. Metadaten-Check: Plakate sind Hochformat (Höhe > Breite)
     portraits = []
-    for f in candidates:
-        try:
-            with Image.open(f) as img:
-                w, h = img.size
-                if h > w and (h / max(1, w)) >= 1.15:
-                    portraits.append((h / w, f))
-        except Exception:
-            pass
+    if Image is not None:
+        for f in candidates:
+            try:
+                with Image.open(f) as img:
+                    w, h = img.size
+                    if h > w and (h / max(1, w)) >= 1.15:
+                        portraits.append((h / w, f))
+            except Exception:
+                pass
 
     if portraits:
-        # Sortiere nach bestem Filmplakat-Verhältnis (~1.4 bis 1.5)
         portraits.sort(key=lambda x: abs(x[0] - 1.48))
         return portraits[0][1]
 
     # 3. Fallback: Erstes Bild, das kein backdrop / fanart im Namen hat
     for f in candidates:
         fname = f.stem.lower()
-        if not any(x in fname for x in ("backdrop", "fanart", "thumb", "banner", "logo", "clearart")):
+        if not any(x in fname for x in ("backdrop", "fanart", "thumb", "banner", "logo", "clearart", "art", "landscape")):
             return f
 
     return candidates[0]
 
 
 def resolve_media_path(raw_path_str: str) -> Path:
-    """Multi-Platten-Mapping: Löst Pfade über ZimaOS-Platten auf (/media/Serien, /media/HDD-Storage)"""
+    """Multi-disk path mapping: Resolves media paths across container mounts"""
     raw_str = raw_path_str.replace("\\", "/")
     p = Path(raw_str)
     if p.exists():
@@ -492,7 +516,7 @@ def get_jellyfin_headers(api_key: str) -> dict:
     return {
         "X-Emby-Token": clean_key,
         "X-MediaBrowser-Token": clean_key,
-        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="ZimaOS", DeviceId="theme-fetcher-zimaos", Version="1.8.0"',
+        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="2.4.0"',
         "Accept": "application/json"
     }
 
@@ -638,7 +662,7 @@ def check_item_theme(it: dict, existing: Optional[dict] = None, cfg: Optional[di
             it["dir"] = d_str
             return True, d_str, theme_file
 
-    # Rekursive Suche im gesamten /media Mount nach Ordnername (z. B. Die Dinos)
+    # Recursive search in /media mount for matching folder name
     title_raw = it.get("title", "").strip().lower()
     title_slug = slugify(title_raw)
     media_base = Path("/media")
@@ -1175,7 +1199,7 @@ def post_process_audio(input_file: Path, output_file: Path, duration: int, fade:
     return True
 
 
-def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None, min_dur: int = 25, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata", fade: bool = True) -> dict:
+def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, custom_title: Optional[str] = None, blacklist: List[str] = None, min_dur: int = 25, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata", fade: bool = True) -> dict:
     global scan_progress
     item_id = item["id"]
     blacklist = blacklist or []
@@ -1204,7 +1228,17 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
 
     candidates = []
     if is_direct_url:
-        candidates = [{"url": custom_query_or_url, "title": "Manueller Link", "id": custom_query_or_url, "duration": 180}]
+        cand_title = (custom_title or "").strip()
+        if not cand_title:
+            try:
+                t_res = subprocess.run(["yt-dlp", "--print", "title", custom_query_or_url], capture_output=True, text=True, timeout=12)
+                if t_res.returncode == 0 and t_res.stdout.strip():
+                    cand_title = t_res.stdout.strip()
+            except Exception:
+                pass
+        if not cand_title:
+            cand_title = "Theme Music"
+        candidates = [{"url": custom_query_or_url, "title": cand_title, "id": custom_query_or_url, "duration": 180}]
     else:
         scan_progress["item_status"][item_id] = {"status": "searching", "percent": 20, "step": "Searching soundtrack..."}
         search_list = (
@@ -1519,52 +1553,74 @@ def run_download_queue(scope: str = "all"):
 
 @app.get("/poster/{item_id}")
 def get_poster(item_id: str):
-    """Liefert das hochauflösende Cover: Erst per Jellyfin-API, dann tolerante lokale Metadaten-Erkennung"""
+    """Liefert das Cover mit lokalem Cache: Erst Jellyfin/Plex-API ohne falsche JSON-Headers, dann Festplatte"""
     state = load_state()
     cfg = load_config()
     item = state["items"].get(item_id)
     if not item:
         raise HTTPException(status_code=404)
 
-    # 1. Prio: Jellyfin Primary Image API (funktioniert immer unabhängig von Festplatten-Dateinamen!)
+    # 0. Schneller lokaler Cache: Verhindert 100 parallele API-Anfragen an Jellyfin!
+    cached_cover = POSTERS_DIR / f"{item_id}.jpg"
+    if cached_cover.exists() and cached_cover.stat().st_size > 500:
+        return FileResponse(cached_cover, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
+
+    # 1. Prio: Jellyfin Image API (WICHTIG: OHNE Accept: application/json, sonst 406 oder kein Bild!)
     if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
-        jf_url = cfg["jellyfin_url"]
+        jf_url = clean_url_input(cfg["jellyfin_url"])
         raw_id = item["jf_raw_id"]
         api_key = cfg.get("jellyfin_api_key", "").strip()
-        headers = get_jellyfin_headers(api_key)
+        
+        # Spezielle Header für Binärbilder
+        img_headers = {
+            "X-Emby-Token": api_key,
+            "Authorization": f'MediaBrowser Token="{api_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="2.4.0"'
+        }
 
         for img_type in ("Primary", "Thumb", "Backdrop"):
             img_url = f"{jf_url}/Items/{raw_id}/Images/{img_type}"
             try:
                 r = requests.get(
                     img_url,
-                    headers=headers,
-                    params={"fillWidth": "240", "quality": "90", "api_key": api_key},
-                    timeout=5
+                    headers=img_headers,
+                    params={"fillWidth": "300", "quality": "90", "api_key": api_key},
+                    timeout=8
                 )
                 if r.status_code == 200 and len(r.content) > 500:
                     ct = r.headers.get("Content-Type", "image/jpeg")
-                    return Response(content=r.content, media_type=ct)
+                    try:
+                        cached_cover.write_bytes(r.content)
+                    except Exception:
+                        pass
+                    return Response(content=r.content, media_type=ct, headers={"Cache-Control": "public, max-age=604800"})
             except Exception:
                 pass
 
     # 2. Prio: Plex Thumbnail
     if item.get("source") == "Plex" and item.get("plex_thumb") and cfg.get("plex_url"):
-        plex_url = cfg["plex_url"]
+        plex_url = clean_url_input(cfg["plex_url"])
         token = cfg.get("plex_token", "").strip()
         try:
-            r = requests.get(f"{plex_url}{item['plex_thumb']}", headers={"X-Plex-Token": token}, timeout=5)
+            r = requests.get(f"{plex_url}{item['plex_thumb']}", headers={"X-Plex-Token": token}, timeout=8)
             if r.status_code == 200 and len(r.content) > 500:
                 ct = r.headers.get("Content-Type", "image/jpeg")
-                return Response(content=r.content, media_type=ct)
+                try:
+                    cached_cover.write_bytes(r.content)
+                except Exception:
+                    pass
+                return Response(content=r.content, media_type=ct, headers={"Cache-Control": "public, max-age=604800"})
         except Exception:
             pass
 
     # 3. Prio: Lokale Festplatten-Erkennung (Hochformat & flexible Dateinamen)
     p = Path(item.get("dir", ""))
-    cover_file = find_local_cover_image(p, title=item.get("title", ""))
+    cover_file = find_local_cover_image(p, title=item.get("title", ""), raw_path_str=item.get("raw_path", ""))
     if cover_file and cover_file.exists():
-        return FileResponse(cover_file)
+        try:
+            shutil.copyfile(cover_file, cached_cover)
+        except Exception:
+            pass
+        return FileResponse(cover_file, headers={"Cache-Control": "public, max-age=604800"})
 
     # 4. Fallback: Saubere SVG-Initialen
     initial = (item.get("title") or "?")[0].upper()
@@ -1734,6 +1790,7 @@ def scan_single(
 def replace_theme(
     item_id: str,
     custom_input: str = Form(""),
+    custom_title: Optional[str] = Form(""),
     tab: str = Form("filme"),
     filter_status: str = Form("all"),
     q: str = Form("")
@@ -1753,6 +1810,7 @@ def replace_theme(
     dl_res = search_and_download(
         item,
         custom_query_or_url=custom_input.strip() or None,
+        custom_title=custom_title.strip() if custom_title else None,
         blacklist=state["blacklist"].get(item_id, []),
         min_dur=cfg.get("min_duration_sec", 25),
         max_dur=cfg.get("max_duration_sec", 270),
@@ -1822,6 +1880,15 @@ def api_test_folder(data: TestFolderReq):
     return test_folder_path(data.paths)
 
 
+
+@app.get("/set-language")
+def set_language(lang: str = "en", tab: str = "movies", filter_status: str = "all", q: str = ""):
+    cfg = load_config()
+    cfg["ui_language"] = "de" if lang == "de" else "en"
+    save_config(cfg)
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
 @app.get("/settings", response_class=HTMLResponse)
 def get_settings_page():
     cfg = load_config()
@@ -1871,7 +1938,7 @@ def get_settings_page():
         <div class="nav-back">
             <a href="/">{get_t(cfg, "back_to_lib")}</a>
         </div>
-        <h1>⚙️ {get_t(cfg, "settings_title")}</h1>
+        <h1>⚙️ {get_t(cfg, "settings_title")} <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v24</span></h1>
 
         <form method="post" action="/settings">
             <div class="card">
@@ -1905,7 +1972,7 @@ def get_settings_page():
                     <div class="form-group">
                         <label>{get_t(cfg, "lbl_jf_url")}</label>
                         <input type="text" id="cfg_jf_url" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}">
-                        <small>Standard-Port: <strong>8096</strong> (z. B. <code>192.168.178.50:8096</code>)</small>
+                        <small>{get_t(cfg, "sub_jf_url")}</small>
                     </div>
                     <div class="form-group">
                         <label>{get_t(cfg, "lbl_jf_key")}</label>
@@ -1917,7 +1984,7 @@ def get_settings_page():
                     <div class="form-group">
                         <label>{get_t(cfg, "lbl_plex_url")}</label>
                         <input type="text" id="cfg_plex_url" name="plex_url" value="{cfg.get('plex_url', '')}">
-                        <small>Standard-Port: <strong>32400</strong> (z. B. <code>192.168.178.50:32400</code>)</small>
+                        <small>{get_t(cfg, "sub_plex_url")}</small>
                     </div>
                     <div class="form-group">
                         <label>{get_t(cfg, "lbl_plex_token")}</label>
@@ -2120,6 +2187,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     items.sort(key=lambda x: (x.get("has_theme", False), x.get("title", "").lower()))
     st_cache = state.get("soundtrack_cache", {})
 
+    del_confirm_msg = get_t(cfg, "btn_delete_confirm")
     rows = ""
     for it in items:
         iid = it["id"]
@@ -2135,9 +2203,9 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         )
 
         badge = (
-            '<span class="badge ok">{get_t(cfg, "status_present")}</span>'
+            f'<span class="badge ok">{get_t(cfg, "status_present")}</span>'
             if has_theme
-            else '<span class="badge miss">{get_t(cfg, "status_missing")}</span>'
+            else f'<span class="badge miss">{get_t(cfg, "status_missing")}</span>'
         )
         player = (
             f'<audio controls preload="none" src="/audio/{iid}?t={int(time.time())}"></audio>'
@@ -2147,6 +2215,8 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
 
         if has_theme:
             v_title = it.get("video_title") or it.get("status") or "theme.mp3"
+            if v_title in ("Vorhanden", "Present", "Heruntergeladen", "Downloaded", "Manueller Link"):
+                v_title = "theme.mp3"
             sub_info = f"<div style='font-size:0.75rem; color:#5ce69a; margin-top:3px;'>🎵 {v_title}</div>"
         else:
             err_msg = it.get("status") or ""
@@ -2162,7 +2232,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             </td>
             <td>
                 <strong>{it['title']}</strong>{orig_hint} <small>({it.get('year') or '-'})</small><br>
-                <span class="meta">{it['source']} • <code>{it.get('dir')}</code></span>
+                <span class="meta">{it.get('source', 'Local')} • <code>{it.get('dir') or it.get('path', '')}</code></span>
                 {st_hint}
             </td>
             <td>
@@ -2203,7 +2273,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     </div>
                     <span id="prog_bar_txt_{iid}" style="color:#7db2ff; font-size:0.75rem;">Processing...</span>
                 </div>
-                <span id="prog_static_{iid}" style="color:#7d8590;">{'✓ Ready' if has_theme else 'Missing'}</span>
+                <span id="prog_static_{iid}" style="color:#7d8590;">{get_t(cfg, 'status_ready') if has_theme else get_t(cfg, 'status_missing')}</span>
             </td>
         </tr>
         """
@@ -2295,11 +2365,11 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     <body>
         <div class="header">
             <div>
-                <h1>🎵 Theme Fetcher</h1>
+                <h1>🎵 Theme Fetcher <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v24</span></h1>
                 <div class="stats">{get_t(cfg, "movies")}: {filme_ok}/{total_filme} • {get_t(cfg, "shows")}: {serien_ok}/{total_serien} • {get_t(cfg, "collections")}: {cols_ok}/{total_cols}</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                <a href="/settings" class="btn secondary">⚙️ {get_t(cfg, "settings")}</a>
+                <div style="display:inline-flex; border:1px solid #343840; border-radius:6px; overflow:hidden; margin-right:4px;"><a href="/set-language?lang=en&tab={clean_tab}&filter_status={filter_status}&q={q}" style="padding:6px 10px; font-size:0.8rem; text-decoration:none; font-weight:600; background:{'#2b7de9' if cfg.get('ui_language','en')=='en' else '#1e2126'}; color:#fff;">🇬🇧 EN</a><a href="/set-language?lang=de&tab={clean_tab}&filter_status={filter_status}&q={q}" style="padding:6px 10px; font-size:0.8rem; text-decoration:none; font-weight:600; background:{'#2b7de9' if cfg.get('ui_language','en')=='de' else '#1e2126'}; color:#fff;">🇩🇪 DE</a></div><a href="/settings" class="btn secondary">⚙️ {get_t(cfg, "settings")}</a>
 
                 <form method="post" action="/scan" style="display:inline;">
                     <input type="hidden" name="scope" value="{current_scope}">
@@ -2442,12 +2512,86 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                 }}
             }}, true);
 
+            function formatTimeSec(sec) {{
+                if (isNaN(sec) || sec < 0) return '00:00';
+                const m = Math.floor(sec / 60);
+                const s = Math.floor(sec % 60);
+                return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+            }}
+
+            function togglePlay(id) {{
+                const audio = document.getElementById('audio_' + id);
+                const btn = document.getElementById('btn_play_' + id);
+                if (!audio) return;
+                if (audio.paused) {{
+                    audio.volume = 0.5;
+                    document.querySelectorAll('audio').forEach(a => {{ if (a !== audio) a.pause(); }});
+                    document.querySelectorAll('[id^="btn_play_"]').forEach(b => {{ b.innerText = '▶'; }});
+                    audio.play();
+                    if (btn) btn.innerText = '⏸';
+                }} else {{
+                    audio.pause();
+                    if (btn) btn.innerText = '▶';
+                }}
+            }}
+
+            function seekMid(id) {{
+                const audio = document.getElementById('audio_' + id);
+                if (!audio) return;
+                if (audio.duration && !isNaN(audio.duration) && audio.duration > 0) {{
+                    audio.currentTime = audio.duration / 2;
+                }} else {{
+                    audio.currentTime = 45;
+                }}
+                if (audio.paused) {{
+                    togglePlay(id);
+                }}
+            }}
+
+            function onSeekInput(id) {{
+                const audio = document.getElementById('audio_' + id);
+                const slider = document.getElementById('seek_' + id);
+                if (!audio || !slider) return;
+                if (audio.duration && !isNaN(audio.duration)) {{
+                    audio.currentTime = (slider.value / 100) * audio.duration;
+                }}
+            }}
+
+            function updateSeek(id) {{
+                const audio = document.getElementById('audio_' + id);
+                const slider = document.getElementById('seek_' + id);
+                const timeSpan = document.getElementById('time_' + id);
+                const btn = document.getElementById('btn_play_' + id);
+                if (!audio || !slider) return;
+
+                if (audio.paused && btn && btn.innerText !== '▶') {{
+                    btn.innerText = '▶';
+                }} else if (!audio.paused && btn && btn.innerText !== '⏸') {{
+                    btn.innerText = '⏸';
+                }}
+
+                if (audio.duration && !isNaN(audio.duration) && audio.duration > 0) {{
+                    slider.value = (audio.currentTime / audio.duration) * 100;
+                    if (timeSpan) {{
+                        timeSpan.innerText = formatTimeSec(audio.currentTime) + ' / ' + formatTimeSec(audio.duration);
+                    }}
+                }}
+            }}
+
+            function initSeek(id) {{
+                const audio = document.getElementById('audio_' + id);
+                const timeSpan = document.getElementById('time_' + id);
+                if (audio && timeSpan && audio.duration && !isNaN(audio.duration)) {{
+                    timeSpan.innerText = '00:00 / ' + formatTimeSec(audio.duration);
+                }}
+            }}
+
             function closeModal(id) {{
-                // Pausiere alle Audios im Modal
                 const modal = document.getElementById(id);
                 if (modal) {{
                     const audios = modal.getElementsByTagName('audio');
                     for (let a of audios) a.pause();
+                    document.querySelectorAll('[id^="btn_play_"]').forEach(b => {{ b.innerText = '▶'; }});
                     modal.style.display = 'none';
                 }}
             }}
@@ -2497,17 +2641,27 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     }}
 
                     list.innerHTML = data.candidates.map(c => `
-                        <div class="candidate-row">
-                            <div style="flex:1; min-width:200px;">
-                                <div style="font-weight:600; font-size:0.9rem; color:#e4e6eb;">${{c.title}}</div>
-                                <div style="font-size:0.75rem; color:#8b929a; margin-top:2px;">
-                                    ${{c.uploader ? (c.uploader + ' • ') : ''}}{get_t(cfg, "modal_length")}${{c.duration_str}}
-                                    • <a href="${{c.url}}" target="_blank" rel="noopener" style="color:#7db2ff; text-decoration:none;">{get_t(cfg, "modal_open_yt")}</a>
+                        <div class="candidate-row" style="padding:12px; border-bottom:1px solid #2b2f38; display:flex; flex-direction:column; gap:8px;">
+                            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+                                <div style="flex:1;">
+                                    <div style="font-weight:600; font-size:0.92rem; color:#e4e6eb;">${{c.title}}</div>
+                                    <div style="font-size:0.75rem; color:#8b929a; margin-top:2px;">
+                                        ${{c.uploader ? (c.uploader + ' • ') : ''}}{get_t(cfg, "modal_length")}${{c.duration_str}}
+                                        • <a href="${{c.url}}" target="_blank" rel="noopener" style="color:#7db2ff; text-decoration:none;">{get_t(cfg, "modal_open_yt")}</a>
+                                    </div>
                                 </div>
+                                <button type="button" class="btn-sm success" style="padding:6px 14px; font-weight:600;" onclick="applyCandidateTheme('${{currentModalItemId}}', '${{c.url}}', '${{encodeURIComponent(c.title || \'\')}}')">{get_t(cfg, "modal_apply")}</button>
                             </div>
-                            <div style="display:flex; align-items:center; gap:8px;">
-                                <audio controls preload="none" src="/api/candidate-stream?v=${{encodeURIComponent(c.id)}}" style="width:160px; height:30px;"></audio>
-                                <button type="button" class="btn-sm success" onclick="applyCandidateTheme('${{currentModalItemId}}', '${{c.url}}')">{get_t(cfg, "modal_apply")}</button>
+                            
+                            <div style="display:flex; align-items:center; gap:8px; background:#181b20; padding:6px 10px; border-radius:6px; border:1px solid #2d323b;">
+                                <audio id="audio_${{c.id}}" preload="none" src="/api/candidate-stream?v=${{encodeURIComponent(c.id)}}" ontimeupdate="updateSeek('${{c.id}}')" onloadedmetadata="initSeek('${{c.id}}')"></audio>
+                                
+                                <button type="button" class="btn-sm" id="btn_play_${{c.id}}" onclick="togglePlay('${{c.id}}')" style="background:#2b7de9; min-width:32px; padding:4px 8px;" title="Play / Pause">▶</button>
+                                <button type="button" class="btn-sm secondary" onclick="seekMid('${{c.id}}')" style="font-size:0.75rem; padding:4px 8px; white-space:nowrap;" title="{get_t(cfg, 'modal_seek_title')}">{get_t(cfg, "modal_seek_mid")}</button>
+                                
+                                <input type="range" id="seek_${{c.id}}" min="0" max="100" value="0" style="flex:1; cursor:pointer; accent-color:#2b7de9;" oninput="onSeekInput('${{c.id}}')">
+                                
+                                <span id="time_${{c.id}}" style="font-size:0.75rem; color:#8b929a; font-family:monospace; min-width:85px; text-align:right;">00:00 / ${{c.duration_str || '--:--'}}</span>
                             </div>
                         </div>
                     `).join('');
@@ -2519,7 +2673,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                 }}
             }}
 
-            async function applyCandidateTheme(itemId, customUrl) {{
+            async function applyCandidateTheme(itemId, customUrl, encodedTitle) {{
                 const modal = document.getElementById('themeModal');
                 closeModal('themeModal');
 
@@ -2550,6 +2704,16 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                 inpUrl.name = 'custom_input';
                 inpUrl.value = customUrl;
                 form.appendChild(inpUrl);
+
+                const inpTitle = document.createElement('input');
+                inpTitle.type = 'hidden';
+                inpTitle.name = 'custom_title';
+                try {{
+                    inpTitle.value = decodeURIComponent(encodedTitle || '');
+                }} catch(e) {{
+                    inpTitle.value = encodedTitle || '';
+                }}
+                form.appendChild(inpTitle);
 
                 document.body.appendChild(form);
                 form.submit();
